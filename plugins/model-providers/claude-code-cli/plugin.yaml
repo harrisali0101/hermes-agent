@@ -1,0 +1,5 @@
+name: claude-code-cli-provider
+kind: model-provider
+version: 0.1.0
+description: Claude Code CLI (Max subscription, subprocess)
+author: DIH Hermes Pilot

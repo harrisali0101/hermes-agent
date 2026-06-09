@@ -182,6 +182,12 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="oauth_external",
         inference_base_url=DEFAULT_CODEX_BASE_URL,
     ),
+    "claude-code-cli": ProviderConfig(
+        id="claude-code-cli",
+        name="Claude Code CLI",
+        auth_type="oauth_external",
+        inference_base_url="",
+    ),
     "openai-api": ProviderConfig(
         id="openai-api",
         name="OpenAI API",

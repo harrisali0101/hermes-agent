@@ -321,7 +321,12 @@ def _resolve_runtime_from_pool_entry(
     base_url = (getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or "").rstrip("/")
     api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
     api_mode = "chat_completions"
-    if provider == "openai-codex":
+    if provider == "claude-code-cli":
+        # Subprocess transport (claude --print); no HTTP base_url, no API key.
+        # See agent/claude_code_runtime.py for the per-turn driver.
+        api_mode = "claude_code_cli"
+        base_url = ""
+    elif provider == "openai-codex":
         api_mode = "codex_responses"
         base_url = base_url or DEFAULT_CODEX_BASE_URL
     elif provider == "xai-oauth":
@@ -1399,6 +1404,20 @@ def resolve_runtime_provider(
     behavior (api_mode derived from config).
     """
     requested_provider = resolve_requested_provider(requested)
+
+    # Claude Code CLI short-circuit: subprocess transport, no HTTP creds.
+    # The claude binary reads ~/.claude/.credentials.json itself, so we
+    # return an empty runtime dict and let agent/claude_code_runtime.py
+    # handle the actual call. Skip the entire pool / OAuth-store chain.
+    if requested_provider == "claude-code-cli":
+        return {
+            "provider": "claude-code-cli",
+            "api_mode": "claude_code_cli",
+            "base_url": "",
+            "api_key": "",
+            "source": "subprocess",
+            "requested_provider": requested_provider,
+        }
 
     # Azure Anthropic short-circuit: when explicitly targeting an Azure endpoint
     # with provider="anthropic", bypass _resolve_named_custom_runtime (which would
