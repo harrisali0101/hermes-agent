@@ -37,12 +37,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_TURN_TIMEOUT_SECONDS = 600
 
 
-def _extract_system_prompt(messages: List[Dict[str, Any]]) -> Optional[str]:
-    """Concatenate any system messages into a single ``--system-prompt`` arg.
+def _extract_system_prompt(
+    messages: List[Dict[str, Any]],
+    *,
+    cwd: Optional[str] = None,
+) -> Optional[str]:
+    """Build a single ``--system-prompt`` string from all available sources.
 
-    Hermes typically sends one system message at index 0, but a few flows
-    inject multiple (memory context block, soul, agents.md). We join them
-    with blank lines so claude sees the full instruction stack.
+    Conversation_loop dispatches the claude_code_cli runtime BEFORE hermes'
+    own ``_restore_or_build_system_prompt`` block runs, so any caller-staged
+    system_message is in ``messages`` but the SOUL.md + AGENTS.md + cwd
+    context-file injection happens later and we'd miss it. We mirror the
+    same lookup hermes performs (``load_soul_md`` + ``build_context_files_prompt``)
+    here so the persona reaches claude on the first spawn.
+
+    Precedence: any ``role: system`` messages already in ``messages`` win
+    (these are the caller's explicit overrides — gateway hooks, --system-message
+    flag), followed by the SOUL.md identity slot and the project context
+    files (AGENTS.md > CLAUDE.md > .cursorrules; first match) from ``cwd``.
     """
     parts: list[str] = []
     for msg in messages:
@@ -57,6 +69,27 @@ def _extract_system_prompt(messages: List[Dict[str, Any]]) -> Optional[str]:
                         parts.append(str(txt))
         elif isinstance(content, str) and content.strip():
             parts.append(content)
+
+    # Load SOUL.md + project context the same way hermes' own
+    # build_system_prompt_parts does. Best-effort: if any of these helpers
+    # fail (missing files, import problems) we degrade gracefully and
+    # let claude run with whatever the caller put in messages.
+    try:
+        from agent.prompt_builder import (
+            build_context_files_prompt,
+            load_soul_md,
+        )
+
+        soul = load_soul_md()
+        if soul:
+            parts.append(soul.strip())
+
+        project_ctx = build_context_files_prompt(cwd=cwd, skip_soul=True)
+        if project_ctx:
+            parts.append(project_ctx.strip())
+    except Exception:
+        logger.debug("claude-cli persona load fell back to messages-only", exc_info=True)
+
     if not parts:
         return None
     return "\n\n".join(parts).strip() or None
@@ -211,7 +244,8 @@ def run_claude_code_cli_turn(
             "error": "claude_binary_missing",
         }
 
-    system_prompt = _extract_system_prompt(messages)
+    cwd = getattr(agent, "session_cwd", None) or os.getcwd()
+    system_prompt = _extract_system_prompt(messages, cwd=cwd)
     # If the subprocess isn't running yet AND we have a system prompt, set it
     # on the session so the spawn picks it up. If the subprocess is already
     # running with a different system prompt, the change won't take effect
