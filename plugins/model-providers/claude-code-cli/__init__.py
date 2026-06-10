@@ -26,6 +26,11 @@ claude_code_cli = ProviderProfile(
         "claude-sonnet-4-6",
         "claude-haiku-4-5",
     ),
+    # Auxiliary tasks (title gen, compression, summarisation, memory flush)
+    # default to Haiku — short + frequent, and dramatically cheaper than Opus
+    # against the Max base allowance. Per-task overrides via
+    # auxiliary.<task>.model in config.yaml still win when set.
+    default_aux_model="claude-haiku-4-5",
 )
 
 register_provider(claude_code_cli)

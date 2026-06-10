@@ -1033,6 +1033,210 @@ class AsyncCodexAuxiliaryClient:
         self._real_client = sync_wrapper._real_client
 
 
+# ── Claude Code CLI auxiliary client ─────────────────────────────────────────
+#
+# When the main provider is ``claude-code-cli`` (subprocess-driven Claude Max
+# subscription, see agent/claude_code_runtime.py), auxiliary tasks like
+# compression, summarisation, title generation, memory flush, and session
+# search need an OpenAI-shaped client too. Without this, every aux call falls
+# through to "auto" provider resolution, the routing fails (openrouter
+# unhealthy / no Nous auth), and the journal fills with warnings while the
+# tasks silently abort.
+#
+# Implementation mirrors the codex_app_server runtime: each aux call spawns a
+# ``claude --print --output-format json`` one-shot, parses the JSON object,
+# and builds an OpenAI ChatCompletion-shaped SimpleNamespace so consumers can
+# use the standard ``.choices[0].message.content`` access pattern.
+#
+# Defaults to ``claude-haiku-4-5`` because aux tasks are short, frequent, and
+# Haiku is dramatically cheaper than Opus against the Max base allowance.
+
+CLAUDE_CLI_DEFAULT_AUX_MODEL = "claude-haiku-4-5"
+CLAUDE_CLI_AUX_TIMEOUT_SECONDS = 120
+
+
+class _ClaudeCliCompletionsAdapter:
+    """Drop-in shim that accepts chat.completions.create() kwargs and routes
+    them through a one-shot ``claude --print --output-format json`` subprocess.
+
+    The aux subprocess intentionally does NOT pass ``--mcp-config``: aux tasks
+    (title generation, compression, etc.) should not call gbrain MCP. The
+    main runtime carries that wiring; aux is pure LLM."""
+
+    def __init__(self, model: str):
+        self._model = model or CLAUDE_CLI_DEFAULT_AUX_MODEL
+
+    def _resolve_binary(self) -> Optional[str]:
+        from agent.claude_code_runtime import _find_claude_binary  # lazy
+        return _find_claude_binary() or None
+
+    @staticmethod
+    def _flatten_messages(messages: list) -> tuple:
+        """Collapse OpenAI-shaped messages into (system_prompt, prompt_text)."""
+        from agent.claude_code_runtime import _flatten_messages_to_prompt  # lazy
+        return _flatten_messages_to_prompt(list(messages))
+
+    def create(self, **kwargs) -> Any:
+        import json
+        import os
+        import subprocess
+
+        from agent.claude_code_runtime import _parse_claude_json_output  # lazy
+
+        binary = self._resolve_binary()
+        if binary is None:
+            raise RuntimeError(
+                "claude CLI binary not found on PATH. Install with "
+                "`npm install -g @anthropic-ai/claude-code`."
+            )
+
+        messages = kwargs.get("messages") or []
+        model = kwargs.get("model") or self._model
+        system_prompt, prompt_text = self._flatten_messages(messages)
+        if not prompt_text.strip():
+            # Empty payload — return a stub completion so the caller doesn't
+            # spawn a subprocess for nothing.
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="", role="assistant"),
+                        finish_reason="stop",
+                        index=0,
+                    )
+                ],
+                model=model,
+                usage=SimpleNamespace(
+                    prompt_tokens=0, completion_tokens=0, total_tokens=0
+                ),
+            )
+
+        argv = [
+            binary, "--print",
+            "--output-format", "json",
+            "--input-format", "text",
+            "--disable-slash-commands",
+        ]
+        if model:
+            argv.extend(["--model", str(model)])
+        if system_prompt:
+            argv.extend(["--system-prompt", system_prompt])
+        argv.append(prompt_text)
+
+        timeout = float(
+            kwargs.get("timeout")
+            or os.environ.get("HERMES_CLAUDE_CODE_AUX_TIMEOUT")
+            or CLAUDE_CLI_AUX_TIMEOUT_SECONDS
+        )
+
+        env = dict(os.environ)
+        # Same Max-billing foot-gun defense as the main runtime: strip the
+        # API-key shortcut so the Max subscription bearer wins.
+        env.pop("ANTHROPIC_API_KEY", None)
+
+        try:
+            completed = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"claude CLI aux call timed out after {timeout:.0f}s"
+            ) from exc
+
+        parsed = _parse_claude_json_output(completed.stdout or "")
+        if parsed.get("is_error") or completed.returncode != 0:
+            stderr_tail = (completed.stderr or "").strip()[-2000:]
+            raise RuntimeError(
+                f"claude CLI aux call failed (rc={completed.returncode}, "
+                f"api_error={parsed.get('api_error_status')}); "
+                f"stderr: {stderr_tail or '<empty>'}"
+            )
+
+        result_text = parsed.get("result") or ""
+        usage_in = parsed.get("usage") or {}
+        prompt_tokens = int(usage_in.get("input_tokens") or 0)
+        cache_read = int(usage_in.get("cache_read_input_tokens") or 0)
+        cache_create = int(usage_in.get("cache_creation_input_tokens") or 0)
+        completion_tokens = int(usage_in.get("output_tokens") or 0)
+        total_tokens = prompt_tokens + cache_read + cache_create + completion_tokens
+
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=result_text,
+                        role="assistant",
+                    ),
+                    finish_reason=parsed.get("stop_reason") or "stop",
+                    index=0,
+                )
+            ],
+            model=model,
+            usage=SimpleNamespace(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+            ),
+        )
+
+
+class _ClaudeCliChatShim:
+    def __init__(self, adapter: _ClaudeCliCompletionsAdapter):
+        self.completions = adapter
+
+
+class ClaudeCliAuxiliaryClient:
+    """OpenAI-client-compatible wrapper for one-shot Claude CLI aux calls.
+
+    Consumers can call ``client.chat.completions.create(messages=...)`` as
+    normal. Backed by a ``claude --print`` subprocess per call.
+    """
+
+    def __init__(self, model: str = ""):
+        self._model = model or CLAUDE_CLI_DEFAULT_AUX_MODEL
+        adapter = _ClaudeCliCompletionsAdapter(self._model)
+        self.chat = _ClaudeCliChatShim(adapter)
+        # No HTTP client backing — empty strings are the conventional value
+        # the rest of the aux pipeline uses for subprocess providers.
+        self.api_key = ""
+        self.base_url = ""
+
+    def close(self):
+        # Nothing to release — each create() spawns + reaps its own process.
+        pass
+
+
+class _AsyncClaudeCliCompletionsAdapter:
+    """Async wrapper over the sync adapter via asyncio.to_thread()."""
+
+    def __init__(self, sync_adapter: _ClaudeCliCompletionsAdapter):
+        self._sync = sync_adapter
+
+    async def create(self, **kwargs) -> Any:
+        import asyncio
+        return await asyncio.to_thread(self._sync.create, **kwargs)
+
+
+class _AsyncClaudeCliChatShim:
+    def __init__(self, adapter: _AsyncClaudeCliCompletionsAdapter):
+        self.completions = adapter
+
+
+class AsyncClaudeCliAuxiliaryClient:
+    """Async-compatible wrapper matching AsyncOpenAI.chat.completions.create()."""
+
+    def __init__(self, sync_wrapper: "ClaudeCliAuxiliaryClient"):
+        sync_adapter = sync_wrapper.chat.completions
+        async_adapter = _AsyncClaudeCliCompletionsAdapter(sync_adapter)
+        self.chat = _AsyncClaudeCliChatShim(async_adapter)
+        self.api_key = sync_wrapper.api_key
+        self.base_url = sync_wrapper.base_url
+
+
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
@@ -3757,6 +3961,29 @@ def resolve_provider_client(
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
+    # ── Claude Code CLI (subprocess → Max subscription) ──────────────
+    # Without this branch, a claude-code-cli main provider falls through to
+    # the generic oauth_external arm below and returns (None, None), which
+    # spams the journal with "OAuth provider claude-code-cli not directly
+    # supported" warnings AND silently aborts every aux task (title gen,
+    # compression, memory flush, summarisation).
+    #
+    # The aux client uses Haiku by default for cost — aux tasks are short and
+    # frequent, and Haiku is dramatically cheaper than Opus against the Max
+    # base allowance. Per-task overrides via auxiliary.<task>.model in
+    # config.yaml still win when set.
+    if provider == "claude-code-cli":
+        aux_model = (
+            model
+            or _get_aux_model_for_provider(provider)
+            or CLAUDE_CLI_DEFAULT_AUX_MODEL
+        )
+        final_model = _normalize_resolved_model(aux_model, provider)
+        sync_client = ClaudeCliAuxiliaryClient(model=final_model)
+        if async_mode:
+            return AsyncClaudeCliAuxiliaryClient(sync_client), final_model
+        return sync_client, final_model
+
     # ── xAI Grok OAuth (loopback PKCE → Responses API) ───────────────
     # Without this branch, an xai-oauth main provider falls through to the
     # generic ``oauth_external`` arm below and returns ``(None, None)``,
@@ -4189,6 +4416,8 @@ def resolve_provider_client(
             return resolve_provider_client("openai-codex", model, async_mode)
         if provider == "xai-oauth":
             return resolve_provider_client("xai-oauth", model, async_mode)
+        if provider == "claude-code-cli":
+            return resolve_provider_client("claude-code-cli", model, async_mode)
         # Other OAuth providers not directly supported
         logger.warning("resolve_provider_client: OAuth provider %s not "
                        "directly supported, try 'auto'", provider)
