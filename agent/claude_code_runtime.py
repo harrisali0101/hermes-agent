@@ -37,6 +37,93 @@ logger = logging.getLogger(__name__)
 DEFAULT_TURN_TIMEOUT_SECONDS = 600
 
 
+# ── Reusable helpers (also imported by agent/auxiliary_client.py) ──────────
+
+
+def _flatten_messages_to_prompt(messages: List[Dict[str, Any]]) -> tuple[str, str]:
+    """Collapse OpenAI-shaped messages into (system_prompt, prompt_text).
+
+    Tool messages fold in as plain text with a label so a one-shot subprocess
+    can read the full prior trajectory. Used by both the main runtime's first-
+    turn spawn and by the auxiliary client (one-shot per call).
+    """
+    system_parts: list[str] = []
+    body_parts: list[str] = []
+
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if isinstance(content, list):
+            collected: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") in {"text", "input_text"}:
+                        text = part.get("text") or part.get("content") or ""
+                        if text:
+                            collected.append(str(text))
+                    elif part.get("type") in {"image", "image_url", "input_image"}:
+                        collected.append("[image attached]")
+                elif isinstance(part, str):
+                    collected.append(part)
+            content_text = "\n".join(collected).strip()
+        elif content is None:
+            content_text = ""
+        else:
+            content_text = str(content)
+
+        if role == "system":
+            if content_text:
+                system_parts.append(content_text)
+            continue
+        if role == "user":
+            body_parts.append(f"User: {content_text}")
+        elif role == "assistant":
+            if not content_text and msg.get("tool_calls"):
+                names = []
+                for tc in msg.get("tool_calls") or []:
+                    if isinstance(tc, dict):
+                        fn = (tc.get("function") or {}).get("name")
+                        if fn:
+                            names.append(str(fn))
+                if names:
+                    content_text = f"(called tools: {', '.join(names)})"
+            body_parts.append(f"Assistant: {content_text}")
+        elif role == "tool":
+            tool_name = msg.get("name") or "tool"
+            body_parts.append(f"Tool result ({tool_name}): {content_text}")
+        else:
+            body_parts.append(content_text)
+
+    system_prompt = "\n\n".join(p for p in system_parts if p).strip()
+    user_prompt = "\n\n".join(p for p in body_parts if p).strip()
+    return system_prompt, user_prompt
+
+
+def _parse_claude_json_output(stdout: str) -> Dict[str, Any]:
+    """Parse the JSON object produced by ``claude -p --output-format json``.
+
+    The binary emits exactly one JSON object on success; on error the object
+    carries ``is_error: true`` and the failure text in ``result`` or
+    ``error``. Trailing whitespace / stray non-JSON banner lines tolerated.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        return {"is_error": True, "result": "", "raw": ""}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return {"is_error": True, "result": text[:2000], "raw": text}
+
+
 def _extract_system_prompt(
     messages: List[Dict[str, Any]],
     *,
