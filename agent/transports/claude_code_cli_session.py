@@ -149,6 +149,7 @@ class ClaudeCodeCliSession:
         cwd: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        resume_session_id: Optional[str] = None,
     ) -> None:
         self._claude_bin = claude_bin or _find_claude_binary() or "claude"
         self._model = model
@@ -156,6 +157,12 @@ class ClaudeCodeCliSession:
         self._mcp_config_path = mcp_config_path
         self._permission_mode = permission_mode
         self._extra_args = list(extra_args or [])
+        # If a prior claude session_id was persisted for this hermes session,
+        # add --resume <id> so claude restores conversation state from its own
+        # local cache. Keeps context continuity across hermes.service
+        # restarts (the bug the pilot hit on 2026-06-10).
+        if resume_session_id:
+            self._extra_args.extend(["--resume", resume_session_id])
         self._cwd = cwd or os.getcwd()
         self._env = dict(env) if env else None
         self._on_event = on_event
@@ -163,7 +170,9 @@ class ClaudeCodeCliSession:
         self._client: Optional[ClaudeCodeCliClient] = None
         self._projector = ClaudeCodeCliEventProjector()
         self._interrupt_event = threading.Event()
-        self.session_id: Optional[str] = None
+        # Pre-seed session_id from the resume hint so callers that read it
+        # before the first run_turn() still see something sane.
+        self.session_id: Optional[str] = resume_session_id
         self._closed = False
 
     # ---------- lifecycle ----------
