@@ -238,6 +238,89 @@ def _resolve_mcp_config_path() -> Optional[str]:
     return None
 
 
+# ── Claude session_id persistence (restart-survival) ───────────────────────
+
+
+def _claude_session_state_path(agent) -> Optional[str]:
+    """Return the path to the on-disk file that holds claude's session_id for
+    a given Hermes session, or None if we cannot determine one.
+
+    Mapping: ``HERMES_HOME/claude-sessions/<hermes_session_id>.json``.
+
+    Used so that when the hermes service restarts, the next claude subprocess
+    spawn can call ``--resume <id>`` instead of starting from scratch and
+    losing conversation context that hermes' own session DB still has.
+    """
+    sid = getattr(agent, "session_id", None)
+    if not sid or not isinstance(sid, str):
+        return None
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+    except Exception:
+        return None
+    # Sanitize the session id: only allow safe filename chars.
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in sid)[:128]
+    if not safe:
+        return None
+    state_dir = home / "claude-sessions"
+    return str(state_dir / f"{safe}.json")
+
+
+def _load_resume_session_id(agent) -> Optional[str]:
+    """Load a previously-saved claude session_id for this hermes session.
+
+    Returns the session_id string to pass to ``claude --resume``, or None if
+    we don't have one (fresh chat, missing state file, hermes session_id
+    unknown).
+    """
+    path = _claude_session_state_path(agent)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        val = data.get("claude_session_id")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    except Exception as exc:
+        logger.debug("claude-cli resume state load failed: %s", exc)
+    return None
+
+
+def _save_claude_session_id(agent, claude_session_id: str) -> None:
+    """Persist claude's session_id under HERMES_HOME so it survives restarts.
+
+    Called after each turn's result frame arrives with a session_id. Cheap
+    (small JSON write) and idempotent — claude keeps the same session_id for
+    the lifetime of a subprocess, so subsequent saves are no-ops in terms of
+    content but keep the mtime fresh.
+    """
+    if not claude_session_id or not isinstance(claude_session_id, str):
+        return
+    path = _claude_session_state_path(agent)
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Mode 700 dir so other VM users can't enumerate sessions.
+        try:
+            os.chmod(os.path.dirname(path), 0o700)
+        except OSError:
+            pass
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump({"claude_session_id": claude_session_id}, fh)
+        os.replace(tmp_path, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except Exception as exc:
+        logger.debug("claude-cli resume state save failed: %s", exc)
+
+
 def _ensure_session(agent) -> ClaudeCodeCliSession:
     """Lazy-instantiate one ClaudeCodeCliSession per AIAgent instance.
 
@@ -261,6 +344,20 @@ def _ensure_session(agent) -> ClaudeCodeCliSession:
     model = getattr(agent, "model", None) or getattr(agent, "model_name", None)
     mcp_config_path = _resolve_mcp_config_path()
 
+    # If we have a previously-saved claude session_id for this Hermes
+    # session, pass it via --resume so claude restores the conversation
+    # state from its own local cache. This is the restart-survival path:
+    # when hermes.service is restarted, the old subprocess dies but the
+    # session_id file persists, so the next spawn picks up where we left
+    # off instead of starting a brand-new claude conversation.
+    resume_session_id = _load_resume_session_id(agent)
+    if resume_session_id:
+        logger.info(
+            "claude-cli will resume claude session_id=%s for hermes session=%s",
+            resume_session_id,
+            getattr(agent, "session_id", "<unknown>"),
+        )
+
     session = ClaudeCodeCliSession(
         claude_bin=binary,
         model=model,
@@ -277,6 +374,7 @@ def _ensure_session(agent) -> ClaudeCodeCliSession:
             "HERMES_CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions"
         ),
         cwd=cwd,
+        resume_session_id=resume_session_id,
     )
     agent._claude_cli_session = session
     return session
@@ -382,6 +480,12 @@ def run_claude_code_cli_turn(
     # Splice projected messages into the conversation.
     if turn.projected_messages:
         messages.extend(turn.projected_messages)
+
+    # Persist claude's session_id so the NEXT spawn (after a restart, crash,
+    # or session-retire) can call --resume <id> and restore the conversation
+    # from claude's own local state cache. Cheap idempotent write.
+    if turn.session_id and not turn.interrupted and turn.error is None:
+        _save_claude_session_id(agent, turn.session_id)
 
     # Skill nudge counter — bump per tool iteration, mirroring codex.
     agent._iters_since_skill = (
