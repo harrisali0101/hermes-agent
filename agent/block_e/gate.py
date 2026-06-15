@@ -66,6 +66,33 @@ _SELF_REFUSAL_PATTERNS = [
     r"\bno (matching|relevant) (page|note|content)\b",
 ]
 
+# Operational-response patterns. The bot's reply is the result of calling
+# a hermes-side admin tool (add_to_allowlist / approve_user /
+# record_pending_user / list_pending_users / save_to_scope) — there's no
+# DIH knowledge claim to cite, the tool execution IS the action. Skip the
+# cite-or-refuse gate so the user sees the tool's confirmation text rather
+# than the gate's "couldn't find anything to cite" refusal.
+_OPERATIONAL_PATTERNS = [
+    r"phone added to (?:gateway )?allowlist",
+    r"phone\s+\d+\s+was already on the allowlist",
+    r"\buser onboarded\b",
+    r"\bis already in scopes\.yaml\b",
+    r"\brecorded pending user\b",
+    r"\bpending user .+ already queued\b",
+    r"\d+\s+pending user\(s\)",
+    r"\bno pending users\b",
+    r"\bis restricted to super_admins\b",
+    r"\bsaved to (the )?(general|leadership|finance|super_admin|ceos) scope\b",
+    r"\bphone format invalid\b",
+    r"\btarget_lid format invalid\b",
+    r"\brole '\w+' is not defined\b",
+]
+
+
+def _looks_operational(text: str) -> bool:
+    t = (text or "")
+    return any(re.search(p, t, re.IGNORECASE) for p in _OPERATIONAL_PATTERNS)
+
 
 def _looks_like_self_refusal(text: str) -> bool:
     t = (text or "").lower()
@@ -107,6 +134,16 @@ def run_gate(
         logger.info(
             "block_e: pass-through (not DIH) | sender=%s len=%d",
             sender_lid, len(response_text),
+        )
+        return response_text
+
+    # Operational response — bot just executed an admin/save tool call,
+    # the response IS the tool's confirmation text. Nothing to cite, the
+    # action is the value. Pass through before checking for citations.
+    if _looks_operational(response_text):
+        logger.info(
+            "block_e: pass-through (operational tool result) | sender=%s",
+            sender_lid,
         )
         return response_text
 

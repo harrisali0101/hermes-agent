@@ -44,6 +44,30 @@ _STRONG_DIH_PATTERNS = [
     r"\b(iyad|ghalia|tareq|will|basit|raja|philippe|omar)\b",
 ]
 
+# Explicit operational-request patterns. Short-circuit to NOT-DIH (gate
+# pass-through) when the user is asking the bot to perform an admin/save
+# action rather than asking a knowledge question. The bot's response will
+# be a tool result (confirmation text), which has nothing meaningful to
+# cite — engaging the gate would refuse legitimate tool execution.
+_OPERATIONAL_REQUEST_PATTERNS = [
+    r"\b(allowlist|whitelist|allow[- ]?list)\b",
+    r"\b(approve|onboard)\s+(this|the|new|user|@?\d|@?[A-Za-z])",
+    r"\b(add|remove)\s+(this|the|a|new)?\s*(user|phone|number|person|member)",
+    r"\b(save|capture|put|remember|record)\s+(this|the|that|it|us|me|him|her|them)",
+    r"\bset\s+\w+\s+(as|to)\s+(staff|finance_analyst|director|ceo|super_admin)",
+    r"^\s*/(approve|allowlist|onboard|pending|save|deny)\b",
+    r"\bpending\s+users?\b",
+    r"\b(any|who|whose)\s+(new|pending|waiting)\s+(user|onboard)",
+    r"\bhermes,?\s+(allowlist|approve|save|onboard|add|record|remove|deny)",
+    r"\bphone\s+\d{6,}\b",  # explicit phone numbers in commands
+]
+
+
+def _looks_operational_request(text: str) -> bool:
+    t = (text or "").lower()
+    return any(re.search(p, t, re.IGNORECASE) for p in _OPERATIONAL_REQUEST_PATTERNS)
+
+
 # Soft indicators — bump confidence but don't trigger alone.
 _SOFT_DIH_PATTERNS = [
     r"\b(internal|in[- ]?house|proprietary|confidential)\b",
@@ -141,6 +165,13 @@ def is_dih_question(text: str) -> bool:
     text = text.strip()
 
     if _is_short_chitchat(text):
+        return False
+
+    # Operational/admin requests are not knowledge questions — skip the
+    # gate entirely so tool execution results aren't blocked for lack of
+    # citations.
+    if _looks_operational_request(text):
+        logger.info("block_e.classifier: operational request → pass-through")
         return False
 
     if _looks_strong_dih(text):
