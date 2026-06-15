@@ -27,15 +27,21 @@ _STRONG_DIH_PATTERNS = [
     r"\bdih\b",
     r"\bdigital innovation holdings\b",
     r"\bdigital infrastructure holdings\b",
-    r"\bour (company|team|policy|process|finance|revenue|customers?|clients?|board|strategy|plan)\b",
+    # Possessive "our X" / "our N" — covers the broad set of business-context
+    # nouns the original short curated list missed (legal counsels, suppliers,
+    # advisors, deal names, portfolio etc.). Catches "who are our X", "what's
+    # our X", "where is our X" without needing every noun.
+    r"\bour\s+(company|team|policy|policies|process|processes|finance|revenue|customers?|clients?|board|strategy|plan|legal|counsel|counsels|advisor|advisors|supplier|suppliers|vendor|vendors|deal|deals|investor|investors|lender|lenders|partner|partners|firm|firms|fund|funds|portfolio|tower|towers|capital|q[1-4]|quarter|pipeline|pipelines|risk|risks|milestone|milestones|brief|briefs)\b",
     r"\bthe company('s)?\b",
-    r"\bour (q[1-4]|quarter)\b",
     # Scope names from scopes.yaml
     r"\b(super[_ -]?admin|leadership|ceos?)\b",
     # DIH-specific nouns
     r"\b(runbook|deployment|on[- ]?call|incident|sla)\b",
     r"\b(revenue|p&l|margin|opex|capex|burn|runway)\b",
     r"\b(roadmap|okr|kpi|hiring plan|all[- ]?hands)\b",
+    # Named projects + people from the DIH ref docs (questionnaires + pipelines).
+    r"\bproject\s+(mesec|ampere|heirloom|signal|ukraine)\b",
+    r"\b(iyad|ghalia|tareq|will|basit|raja|philippe|omar)\b",
 ]
 
 # Soft indicators — bump confidence but don't trigger alone.
@@ -141,7 +147,11 @@ def is_dih_question(text: str) -> bool:
         logger.info("block_e.classifier: strong-keyword DIH match")
         return True
 
-    if not _looks_soft_dih(text) and len(text.split()) < 6:
+    # Short-circuit only the ultra-short cases (≤3 words after chitchat). Any
+    # 4-word+ question goes to Sonnet — that's what it's for. The previous
+    # `< 6` threshold skipped genuine DIH questions like "who are our legal
+    # counsels?" (5 words) when the curated keyword list missed them.
+    if not _looks_soft_dih(text) and len(text.split()) <= 3:
         return False
 
     # Allow disabling the Sonnet judge for cost/latency tuning via env var.
