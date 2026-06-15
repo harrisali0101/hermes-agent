@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.parse
@@ -425,12 +426,102 @@ def _exchange_for_oauth_token(client_id: str, client_secret: str) -> Optional[st
     return str(token).strip() if token else None
 
 
-def _write_per_session_mcp_config(agent, access_token: str) -> Optional[str]:
+def _resolve_authorized_write_scopes(role: str) -> List[str]:
+    """Given a verified role, return the scopes that role may write to,
+    per scopes.yaml. super_admin gets god mode (all defined scopes).
+
+    Empty list = nothing authorized; caller will fall back gracefully and
+    `hermes_save:save_to_scope` will reject any call. Bot is still functional
+    for reads through the primary `gbrain` MCP server.
+    """
+    data = _load_scopes_yaml() or {}
+    all_scopes = list((data.get("scopes") or {}).keys())
+    if role == "super_admin":
+        return all_scopes
+    role_def = (data.get("roles") or {}).get(role) or {}
+    writes = role_def.get("writes") or []
+    return [s for s in writes if s in all_scopes]
+
+
+def _mint_bearers_for_writer_roles(scopes: List[str]) -> Dict[str, str]:
+    """For each scope, look up its writer_role in scopes.yaml, fetch that
+    role's OAuth creds from KV, exchange for an access_token, return a
+    {writer_role: bearer} dict. Deduped (multiple scopes may share a
+    writer_role in future configs).
+    """
+    data = _load_scopes_yaml() or {}
+    scope_map = data.get("scopes") or {}
+    writer_roles: List[str] = []
+    for s in scopes:
+        scope_def = scope_map.get(s) or {}
+        wr = str(scope_def.get("writer_role") or "").strip()
+        if wr and wr not in writer_roles:
+            writer_roles.append(wr)
+    bearers: Dict[str, str] = {}
+    for wr in writer_roles:
+        creds = _fetch_oauth_creds_from_kv(wr)
+        if not creds:
+            logger.warning(
+                "save-router: KV fetch failed for writer_role=%r — skip", wr,
+            )
+            continue
+        token = _exchange_for_oauth_token(*creds)
+        if not token:
+            logger.warning(
+                "save-router: /token exchange failed for writer_role=%r — skip", wr,
+            )
+            continue
+        bearers[wr] = token
+    return bearers
+
+
+def _write_per_session_bearers_file(agent, bearers: Dict[str, str]) -> Optional[str]:
+    """Write {writer_role: bearer} JSON to a per-session file consumed by
+    hermes_save_mcp.py via HERMES_BEARERS_FILE env var. Mode 600."""
+    sid = getattr(agent, "session_id", None)
+    if not sid or not isinstance(sid, str):
+        return None
+    try:
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+    except Exception:
+        return None
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in sid)[:128]
+    if not safe:
+        return None
+    state_dir = home / "claude-mcp-sessions"
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(state_dir, 0o700)
+    except Exception:
+        pass
+    path = str(state_dir / f"save-bearers-{safe}.json")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(bearers, fh)
+        os.chmod(path, 0o600)
+    except Exception as exc:
+        logger.warning("save-bearers file write failed: %s", exc)
+        return None
+    return path
+
+
+def _write_per_session_mcp_config(
+    agent,
+    access_token: str,
+    bearers_path: Optional[str] = None,
+    sender_lid: Optional[str] = None,
+) -> Optional[str]:
     """Write a per-session claude-mcp.json with the role-scoped bearer.
 
     Lives at HERMES_HOME/claude-mcp-<safe-session-id>.json (mode 600 / dir 700)
     so each hermes session uses its own file and concurrent sessions don't
     stomp each other.
+
+    Adds a `hermes_save` stdio MCP server entry (shape-2 scoped writes) when
+    bearers_path is provided — the bot uses `save_to_scope` to route writes
+    to the right OAuth client per content scope. The primary `gbrain` server
+    stays attached for reads + admin operations.
     """
     sid = getattr(agent, "session_id", None)
     if not sid or not isinstance(sid, str):
@@ -450,15 +541,31 @@ def _write_per_session_mcp_config(agent, access_token: str) -> Optional[str]:
     except Exception:
         pass
     path = str(state_dir / f"claude-mcp-{safe}.json")
-    config = {
-        "mcpServers": {
-            "gbrain": {
-                "type": "http",
-                "url": f"{_GBRAIN_BASE_URL}/mcp",
-                "headers": {"Authorization": f"Bearer {access_token}"},
-            }
+    mcp_servers: Dict[str, Any] = {
+        "gbrain": {
+            "type": "http",
+            "url": f"{_GBRAIN_BASE_URL}/mcp",
+            "headers": {"Authorization": f"Bearer {access_token}"},
         }
     }
+    if bearers_path and sender_lid:
+        # Resolve the on-disk location of hermes_save_mcp.py (sibling of this file).
+        save_mcp_module = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "hermes_save_mcp.py",
+        )
+        mcp_servers["hermes_save"] = {
+            "type": "stdio",
+            "command": sys.executable or "python3",
+            "args": [save_mcp_module],
+            "env": {
+                "HERMES_SENDER_LID": sender_lid,
+                "HERMES_SCOPES_YAML": _SCOPES_YAML_PATH,
+                "HERMES_BEARERS_FILE": bearers_path,
+                "HERMES_GBRAIN_URL": _GBRAIN_BASE_URL,
+            },
+        }
+    config = {"mcpServers": mcp_servers}
     try:
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(config, fh)
@@ -472,8 +579,20 @@ def _write_per_session_mcp_config(agent, access_token: str) -> Optional[str]:
 def _resolve_per_session_mcp_config(agent) -> Optional[str]:
     """Top-level helper: returns the per-session claude-mcp.json path on
     success, or None to fall back to the static default. Logs at every step
-    so failures are one-grep away."""
+    so failures are one-grep away.
+
+    Shape:
+      * Primary `gbrain` MCP server uses the sender's role-scoped bearer for
+        reads + admin ops (federated_read across the sender's authorized
+        scopes, per oauth_clients.federated_read).
+      * Secondary `hermes_save` stdio MCP server exposes one tool
+        (save_to_scope). It picks the right OAuth client bearer per write
+        based on scopes.yaml's writer_role mapping. Without writer bearers
+        the config falls back to gbrain-only (saves will land on the
+        sender's bound source_id only).
+    """
     role = _resolve_role_for_sender(agent)
+    sender_lid = str(getattr(agent, "_user_id", "") or "").strip()
     if not role:
         logger.info(
             "per-session OAuth: no role resolved for sender (%r) — fall back to static bearer",
@@ -494,7 +613,29 @@ def _resolve_per_session_mcp_config(agent) -> Optional[str]:
             role,
         )
         return None
-    path = _write_per_session_mcp_config(agent, token)
+
+    # Mint per-scope writer bearers for the save router (shape-2 scoped writes).
+    # Non-fatal: if this fails for any scope, the bot loses scoped-write
+    # capability for that scope but still reads + writes via primary gbrain.
+    bearers_path: Optional[str] = None
+    write_scopes = _resolve_authorized_write_scopes(role)
+    if write_scopes:
+        bearers = _mint_bearers_for_writer_roles(write_scopes)
+        if bearers:
+            bearers_path = _write_per_session_bearers_file(agent, bearers)
+            logger.info(
+                "save-router: role=%r write_scopes=%s bearers_path=%s",
+                role, write_scopes, bearers_path,
+            )
+        else:
+            logger.warning(
+                "save-router: no writer bearers minted for role=%r (scopes=%s) — save_to_scope will fail closed",
+                role, write_scopes,
+            )
+
+    path = _write_per_session_mcp_config(
+        agent, token, bearers_path=bearers_path, sender_lid=sender_lid,
+    )
     if not path:
         logger.warning(
             "per-session OAuth: mcp config write failed for role=%r — fall back to static bearer",
@@ -502,8 +643,8 @@ def _resolve_per_session_mcp_config(agent) -> Optional[str]:
         )
         return None
     logger.info(
-        "per-session OAuth: role=%r mcp_config=%s (token_len=%d)",
-        role, path, len(token),
+        "per-session OAuth: role=%r mcp_config=%s (token_len=%d, save_router=%s)",
+        role, path, len(token), "on" if bearers_path else "off",
     )
     return path
 
