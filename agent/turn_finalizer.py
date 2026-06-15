@@ -336,6 +336,41 @@ def finalize_turn(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
+    # Phase 7 Block E — cite-or-refuse hard gate.
+    # Runs AFTER plugin transforms so the gate operates on the final
+    # user-facing text. Pass-through for non-DIH questions, replaces the
+    # response with a transparent refusal if a DIH claim is uncited or
+    # un-grounded by any retrieval MCP call this turn, otherwise appends
+    # a clean "Sources:" footer.
+    if final_response and not interrupted:
+        try:
+            from agent.block_e import run_gate as _block_e_run_gate
+            # Resolve sender lid + the OAuth client name from the same
+            # scopes.yaml helpers used by claude_code_runtime.
+            _sender_lid = str(getattr(agent, "_user_id", "") or "").strip()
+            _agent_name = None
+            try:
+                from agent.claude_code_runtime import _resolve_role_for_sender
+                _role = _resolve_role_for_sender(agent)
+                if _role:
+                    # OAuth client convention: `<role>-agent` (see Block A.3).
+                    _agent_name = f"{_role}-agent"
+            except Exception as _role_err:
+                logger.debug("block_e: role resolution failed: %s", _role_err)
+            _gated = _block_e_run_gate(
+                user_message=str(original_user_message or user_message or ""),
+                response_text=final_response,
+                sender_lid=_sender_lid,
+                agent_name=_agent_name,
+            )
+            if isinstance(_gated, str) and _gated:
+                if _gated != final_response:
+                    _response_transformed = True
+                final_response = _gated
+        except Exception as exc:
+            # Gate must NEVER take the bot down — log + pass-through.
+            logger.warning("block_e gate failed (open): %s", exc)
+
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync

@@ -971,6 +971,29 @@ def run_claude_code_cli_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    # Phase 7 Block E — cite-or-refuse hard gate.
+    # Runs on the FINAL response before it's returned upstream, so the
+    # gateway/WhatsApp adapter sees the post-gate text. Must never raise:
+    # the gate failing closed would silence every reply.
+    if turn.final_text and not turn.interrupted and turn.error is None:
+        try:
+            from agent.block_e import run_gate as _block_e_run_gate
+            _sender_lid = str(getattr(agent, "_user_id", "") or "").strip()
+            _role = _resolve_role_for_sender(agent)
+            _agent_name = f"{_role}-agent" if _role else None
+            _gated_text = _block_e_run_gate(
+                user_message=str(original_user_message or user_text or ""),
+                response_text=turn.final_text,
+                sender_lid=_sender_lid,
+                agent_name=_agent_name,
+            )
+            if isinstance(_gated_text, str) and _gated_text:
+                turn.final_text = _gated_text
+        except Exception as _gate_err:
+            # Pass-through on any failure — gate is defense-in-depth, not
+            # a single point of failure for the bot.
+            logger.warning("block_e gate raised (open): %s", _gate_err)
+
     return {
         "final_response": turn.final_text,
         "messages": messages,
