@@ -24,8 +24,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import tempfile
-from typing import Any, Dict, List, Optional
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.transports.claude_code_cli_session import (
     ClaudeCodeCliSession,
@@ -254,6 +258,256 @@ def _wrap_with_verified_sender(agent, user_text: str) -> str:
     return f"<verified_sender {attrs}/>\n{user_text}"
 
 
+# ── Block B: identity → role → per-session OAuth bearer ─────────────────────
+# Phase 7 Block B. Replaces the static gbrain bearer in
+# /home/hermes-user/.hermes/claude-mcp.json with a per-session OAuth token
+# scoped to the sender's role (looked up in scopes.yaml).
+#
+# Flow per session spawn:
+#   1. agent._user_id → super_admins-list lookup or users:role in scopes.yaml
+#   2. role → KV `hermes-gbrain-oauth-<role>-agent` (JSON: client_id+client_secret)
+#   3. POST gbrain /oauth/token (client_credentials grant) → access_token
+#   4. Write per-session claude-mcp-<safe-sid>.json with that bearer
+#   5. Pass the per-session path via --mcp-config to claude
+#
+# Graceful degradation: any step that fails returns None upstream, and the
+# session falls back to the default static-bearer claude-mcp.json. The bot
+# stays functional but with the legacy hermes-pilot scopes (read write admin)
+# instead of role-scoped access.
+
+# Where scopes.yaml lives on the VM (deploy from azure/config/scopes.yaml).
+_SCOPES_YAML_PATH = os.environ.get(
+    "HERMES_SCOPES_YAML", "/opt/hermes/workspace/scopes.yaml"
+)
+# Azure KV name pattern for OAuth client credentials.
+_KV_NAME = os.environ.get("HERMES_KV_NAME", "kv-dih-nonprod-weu-001")
+# gbrain HTTP base (token endpoint + MCP endpoint).
+_GBRAIN_BASE_URL = os.environ.get("HERMES_GBRAIN_URL", "http://127.0.0.1:7777")
+
+# Process-level cache for scopes.yaml. Reloaded if mtime changes.
+_SCOPES_CACHE: Dict[str, Any] = {"mtime": 0.0, "data": None}
+# Process-level cache for OAuth credentials keyed by role.
+_OAUTH_CREDS_CACHE: Dict[str, Tuple[str, str]] = {}
+
+
+def _load_scopes_yaml() -> Optional[Dict[str, Any]]:
+    """Load + cache scopes.yaml; reload if file mtime changes. Returns None
+    if the file is missing or unparseable — the per-session OAuth path is
+    optional, so callers fall back to the static bearer."""
+    try:
+        st = os.stat(_SCOPES_YAML_PATH)
+    except OSError:
+        return None
+    if _SCOPES_CACHE["data"] is not None and _SCOPES_CACHE["mtime"] == st.st_mtime:
+        return _SCOPES_CACHE["data"]
+    try:
+        import yaml
+        with open(_SCOPES_YAML_PATH, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception as exc:
+        logger.warning("scopes.yaml load failed: %s", exc)
+        return None
+    _SCOPES_CACHE["mtime"] = st.st_mtime
+    _SCOPES_CACHE["data"] = data
+    return data
+
+
+def _resolve_role_for_sender(agent) -> Optional[str]:
+    """Look up the verified sender's role in scopes.yaml.
+
+    Returns:
+      * "super_admin"  if the sender's lid is in the top-level super_admins list
+      * the role name  if listed in users:
+      * None           if no match — caller falls back to static bearer (which
+                       gives legacy hermes-pilot scopes, plus the persona's
+                       "no verified sender = None tier" rule still applies at
+                       the model layer)
+    """
+    user_id = str(getattr(agent, "_user_id", None) or "").strip()
+    if not user_id:
+        return None
+    data = _load_scopes_yaml()
+    if not data:
+        return None
+    for entry in data.get("super_admins") or []:
+        if str(entry.get("id", "")).strip() == user_id:
+            return "super_admin"
+    for entry in data.get("users") or []:
+        if str(entry.get("id", "")).strip() == user_id:
+            role = str(entry.get("role", "")).strip()
+            return role or None
+    return None
+
+
+def _fetch_oauth_creds_from_kv(role: str) -> Optional[Tuple[str, str]]:
+    """Shell-out to `az keyvault secret show` for the role's OAuth credentials.
+
+    The VM's UAI has Key Vault Secrets User role on `kv-dih-nonprod-weu-001`
+    via the user-assigned managed identity; calling `az` here works because
+    fetch-secrets.sh already ran `az login --identity` at service start.
+    Cached per-process keyed by role.
+    """
+    if role in _OAUTH_CREDS_CACHE:
+        return _OAUTH_CREDS_CACHE[role]
+    # KV secret names can't contain underscores, so normalize: super_admin → super-admin
+    secret_name = f"hermes-gbrain-oauth-{role.replace('_', '-')}-agent"
+    try:
+        proc = subprocess.run(
+            [
+                "az", "keyvault", "secret", "show",
+                "--vault-name", _KV_NAME,
+                "--name", secret_name,
+                "--query", "value",
+                "-o", "tsv",
+            ],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        logger.warning("az kv fetch failed for role=%r: %s", role, exc)
+        return None
+    if proc.returncode != 0:
+        logger.warning(
+            "az kv fetch returncode=%d for role=%r; stderr=%s",
+            proc.returncode, role, (proc.stderr or "")[:200],
+        )
+        return None
+    try:
+        payload = json.loads(proc.stdout.strip())
+        cid = str(payload["client_id"]).strip()
+        csec = str(payload["client_secret"]).strip()
+    except Exception as exc:
+        logger.warning("KV payload parse failed for role=%r: %s", role, exc)
+        return None
+    if not cid or not csec:
+        return None
+    _OAUTH_CREDS_CACHE[role] = (cid, csec)
+    return (cid, csec)
+
+
+def _exchange_for_oauth_token(client_id: str, client_secret: str) -> Optional[str]:
+    """POST gbrain `/oauth/token` with client_credentials grant; return access_token.
+
+    Uses `client_secret_post` (creds in form body) — matches the
+    `Token auth method: client_secret_post` line printed by
+    `gbrain auth register-client`.
+    """
+    # gbrain advertises the token endpoint at /token via
+    # /.well-known/oauth-authorization-server (confirmed 2026-06-15).
+    url = f"{_GBRAIN_BASE_URL}/token"
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body_snippet = ""
+        try:
+            body_snippet = exc.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        logger.warning(
+            "gbrain /oauth/token HTTPError %d: %s", exc.code, body_snippet
+        )
+        return None
+    except Exception as exc:
+        logger.warning("gbrain /oauth/token request failed: %s", exc)
+        return None
+    token = payload.get("access_token")
+    return str(token).strip() if token else None
+
+
+def _write_per_session_mcp_config(agent, access_token: str) -> Optional[str]:
+    """Write a per-session claude-mcp.json with the role-scoped bearer.
+
+    Lives at HERMES_HOME/claude-mcp-<safe-session-id>.json (mode 600 / dir 700)
+    so each hermes session uses its own file and concurrent sessions don't
+    stomp each other.
+    """
+    sid = getattr(agent, "session_id", None)
+    if not sid or not isinstance(sid, str):
+        return None
+    try:
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+    except Exception:
+        return None
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in sid)[:128]
+    if not safe:
+        return None
+    state_dir = home / "claude-mcp-sessions"
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(state_dir, 0o700)
+    except Exception:
+        pass
+    path = str(state_dir / f"claude-mcp-{safe}.json")
+    config = {
+        "mcpServers": {
+            "gbrain": {
+                "type": "http",
+                "url": f"{_GBRAIN_BASE_URL}/mcp",
+                "headers": {"Authorization": f"Bearer {access_token}"},
+            }
+        }
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(config, fh)
+        os.chmod(path, 0o600)
+    except Exception as exc:
+        logger.warning("per-session mcp config write failed: %s", exc)
+        return None
+    return path
+
+
+def _resolve_per_session_mcp_config(agent) -> Optional[str]:
+    """Top-level helper: returns the per-session claude-mcp.json path on
+    success, or None to fall back to the static default. Logs at every step
+    so failures are one-grep away."""
+    role = _resolve_role_for_sender(agent)
+    if not role:
+        logger.info(
+            "per-session OAuth: no role resolved for sender (%r) — fall back to static bearer",
+            getattr(agent, "_user_id", None),
+        )
+        return None
+    creds = _fetch_oauth_creds_from_kv(role)
+    if not creds:
+        logger.warning(
+            "per-session OAuth: KV fetch failed for role=%r — fall back to static bearer",
+            role,
+        )
+        return None
+    token = _exchange_for_oauth_token(*creds)
+    if not token:
+        logger.warning(
+            "per-session OAuth: /oauth/token exchange failed for role=%r — fall back to static bearer",
+            role,
+        )
+        return None
+    path = _write_per_session_mcp_config(agent, token)
+    if not path:
+        logger.warning(
+            "per-session OAuth: mcp config write failed for role=%r — fall back to static bearer",
+            role,
+        )
+        return None
+    logger.info(
+        "per-session OAuth: role=%r mcp_config=%s (token_len=%d)",
+        role, path, len(token),
+    )
+    return path
+
+
 def _resolve_mcp_config_path() -> Optional[str]:
     """Return a filesystem path to a ``--mcp-config`` JSON file if one is
     configured, otherwise None.
@@ -384,7 +638,10 @@ def _ensure_session(agent) -> ClaudeCodeCliSession:
 
     cwd = getattr(agent, "session_cwd", None) or os.getcwd()
     model = getattr(agent, "model", None) or getattr(agent, "model_name", None)
-    mcp_config_path = _resolve_mcp_config_path()
+    # Phase 7 Block B: prefer a per-session role-scoped OAuth bearer if we
+    # can resolve a role for the verified sender; fall back to the static
+    # bearer in fetch-secrets.sh-managed claude-mcp.json on any failure.
+    mcp_config_path = _resolve_per_session_mcp_config(agent) or _resolve_mcp_config_path()
 
     # If we have a previously-saved claude session_id for this Hermes
     # session, pass it via --resume so claude restores the conversation
