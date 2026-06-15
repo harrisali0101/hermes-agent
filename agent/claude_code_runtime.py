@@ -212,6 +212,48 @@ def _latest_user_text(messages: List[Dict[str, Any]], fallback: str) -> str:
     return fallback or ""
 
 
+def _wrap_with_verified_sender(agent, user_text: str) -> str:
+    """Prefix ``user_text`` with a structured ``<verified_sender/>`` marker
+    when the gateway stamped sender info onto ``agent``.
+
+    Hermes' gateway sets ``agent._user_id`` / ``agent.platform`` /
+    ``agent._user_name`` from the verified transport identity (e.g. WhatsApp
+    phone number). The claude CLI subprocess can't see those fields any other
+    way — without this wrap, the model has nothing to anchor identity on and
+    falls back to runtime/account metadata or message-text claims (the
+    2026-06-15 leak). The persona stack (SOUL.md / AGENTS.md / ACCESS_POLICY.md)
+    is taught to read this tag as the ONLY identity ground truth and map the
+    id to a tier.
+
+    Returns ``user_text`` unchanged when no verified sender is present (CLI
+    runs, plugin tests, etc.) — the persona's "no verified sender = None tier"
+    rule then applies.
+    """
+    user_id = str(getattr(agent, "_user_id", None) or "").strip()
+    user_id_alt = str(getattr(agent, "_user_id_alt", None) or "").strip()
+    platform = str(getattr(agent, "platform", None) or "").strip()
+    user_name = str(getattr(agent, "_user_name", None) or "").strip()
+    logger.info(
+        "verified_sender wrap: platform=%r user_id=%r user_id_alt=%r name=%r",
+        platform, user_id, user_id_alt, user_name,
+    )
+    if not user_id or not platform or platform == "cli":
+        return user_text
+
+    def _esc(s: str) -> str:
+        return (
+            s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;")
+        )
+
+    attrs = f'id="{_esc(user_id)}" platform="{_esc(platform)}"'
+    if user_name:
+        attrs += f' name="{_esc(user_name)}"'
+    return f"<verified_sender {attrs}/>\n{user_text}"
+
+
 def _resolve_mcp_config_path() -> Optional[str]:
     """Return a filesystem path to a ``--mcp-config`` JSON file if one is
     configured, otherwise None.
@@ -449,6 +491,10 @@ def run_claude_code_cli_turn(
             "partial": True,
             "error": "empty_prompt",
         }
+    # Prefix with gateway-verified sender so the model can anchor identity on
+    # ACCESS_POLICY.md tiers instead of runtime/account metadata or message
+    # text claims (see _wrap_with_verified_sender docstring).
+    user_text = _wrap_with_verified_sender(agent, user_text)
 
     turn_timeout = float(
         os.environ.get("HERMES_CLAUDE_CODE_TURN_TIMEOUT")
