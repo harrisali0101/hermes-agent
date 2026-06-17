@@ -45,7 +45,10 @@ from agent.block_e.citations import (
     format_references_footer,
     strip_inline_citations,
 )
-from agent.block_e.classifier import is_dih_question
+from agent.block_e.classifier import (
+    _looks_explicit_brain_invocation,
+    _looks_operational_request,
+)
 from agent.block_e.mcp_audit import called_retrieval_tool, list_calls
 
 logger = logging.getLogger(__name__)
@@ -146,8 +149,26 @@ def run_gate(
     if not response_text or not response_text.strip():
         return response_text or ""
 
-    # v0.2: two signals can engage the gate.
-    user_requested_brain = is_dih_question(user_message or "")
+    # v0.2.1: operational / diagnostic user requests are an ABSOLUTE
+    # pass-through. The user asked the bot to run an admin or debug tool
+    # ("list_pages with source=leadership", "approve user X", "run a
+    # health check", "tell me the raw response of get_page"). The bot's
+    # reply IS tool output, not a DIH knowledge claim. Retrieval tools
+    # WILL be called to satisfy the request — so the retrieval-call
+    # signal would otherwise spuriously engage the gate and refuse a
+    # legitimate diagnostic. Detected from the USER message, not the
+    # response, so the decision is robust to whatever shape the bot
+    # picks for its reply.
+    if _looks_operational_request(user_message or ""):
+        logger.info(
+            "block_e: pass-through (operational/diagnostic request from user) "
+            "| sender=%s len=%d",
+            sender_lid, len(response_text),
+        )
+        return response_text
+
+    # Otherwise: two signals can engage the gate.
+    user_requested_brain = _looks_explicit_brain_invocation(user_message or "")
     retrieval_was_called = False
     if agent_name:
         retrieval_was_called = called_retrieval_tool(agent_name, lookback_seconds)
