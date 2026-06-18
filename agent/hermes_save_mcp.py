@@ -1,30 +1,36 @@
-"""Hermes-side MCP server: scoped writes to gbrain.
+"""Hermes-side MCP server: scoped writes + admin tools, with per-sender routing.
 
-Exposes a single tool — `save_to_scope` — that takes (scope, title, body) and
-internally picks the right OAuth client bearer to forward the put_page call
-to gbrain. This lives in Hermes rather than gbrain because gbrain's OAuth
-client hard-binds source_id at registration time; routing per-call requires
-us to maintain N bearers (one per scope) and pick the right one based on
-content classification (which the bot has just done in chat).
+Exposes admin / write tools (`save_to_scope`, `add_to_allowlist`,
+`approve_user`, `record_pending_user`, `list_pending_users`). Each tool
+takes the verified sender's WhatsApp lid as a `sender_lid` argument; the
+proxy looks the role up from scopes.yaml and picks the right per-role
+OAuth bearer from a static bearers file before forwarding the call to
+gbrain.
 
-This module is launched by claude-code-cli as a stdio MCP subprocess; the
-parent (hermes.service) writes a claude-mcp.json that lists this server
-alongside the primary gbrain HTTP server.
+v0.2 (2026-06-18): per-call sender_lid arg instead of per-session env var.
+Required because the new azure-foundry provider doesn't have the
+per-session --mcp-config injection path the previous claude-code-cli
+provider used to pass HERMES_SENDER_LID at startup. With the new design
+the server is launched ONCE by hermes-agent (via config.yaml's
+mcp_servers block) and stays up across all sessions; the persona is
+responsible for adding the verified sender's lid to every tool call.
 
-Env vars (set by claude_code_runtime when configuring the per-session MCP
-config; this module fails closed if any is missing):
+Env vars (read once at startup; no per-session env):
 
-  HERMES_SENDER_LID    — whatsapp lid of the verified sender, used for the
-                         scopes.yaml role lookup + audit log
   HERMES_SCOPES_YAML   — path to scopes.yaml (authorization source of truth)
-  HERMES_BEARERS_FILE  — path to a JSON file `{scope: bearer}` minted by
-                         claude_code_runtime at session start; one bearer per
-                         scope the sender is authorized to write to
+  HERMES_BEARERS_FILE  — path to a JSON file `{scope: bearer}` with one
+                         bearer per scope. Bearers are fetched from Key
+                         Vault by fetch-secrets.sh at hermes startup;
+                         the file is shared across all sessions.
+                         Defaults to /home/hermes-user/.hermes/role-bearers.json.
   HERMES_GBRAIN_URL    — gbrain base url (e.g. http://127.0.0.1:7777)
   HERMES_GBRAIN_TIMEOUT — optional, seconds, default 30
+  HERMES_HERMES_ENV_PATH — optional, defaults to /home/hermes-user/.hermes/.env
+  HERMES_PENDING_USERS_PATH — optional, defaults to the pilot path
 
 Audit: every tool call writes one structured line to stderr so the parent
-shell (hermes.service journal) captures it.
+shell (hermes.service journal) captures it. The `sender_lid` from the
+tool args is included in every audit record.
 """
 
 import json
@@ -46,7 +52,28 @@ def _slugify(text: str, max_len: int = 80) -> str:
 
 _PROTOCOL_VERSION = "2024-11-05"
 _SERVER_NAME = "hermes-save"
-_SERVER_VERSION = "0.1.0"
+_SERVER_VERSION = "0.2.0"
+
+# v0.2: every tool requires the verified sender's lid as a per-call arg
+# (no longer a process-startup env var). The persona MUST include this
+# in every hermes_save:* call, sourced from the most recent
+# <verified_sender id="..."/> marker on the user's message. Without it
+# the server fails closed — no role lookup, no bearer routing, no audit.
+_SENDER_LID_SCHEMA: Dict[str, Any] = {
+    "type": "string",
+    "pattern": r"^\d{6,}@lid$",
+    "description": (
+        "REQUIRED. The verified sender's WhatsApp lid (format "
+        "`<digits>@lid`), copied verbatim from the most recent "
+        "<verified_sender id=\"...\"/> marker on the user's "
+        "message. The server resolves the sender's role from "
+        "scopes.yaml using this lid and picks the right per-role "
+        "OAuth bearer to forward the gbrain call. Never invent or "
+        "guess this — if no verified_sender marker is present "
+        "the call must be refused at the persona layer before "
+        "reaching this tool."
+    ),
+}
 
 
 def _log(level: str, msg: str, **kwargs: Any) -> None:
@@ -209,6 +236,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "sender_lid": _SENDER_LID_SCHEMA,
                         "scope": {
                             "type": "string",
                             "enum": available_scopes,
@@ -234,7 +262,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                             ),
                         },
                     },
-                    "required": ["scope", "title", "body"],
+                    "required": ["sender_lid", "scope", "title", "body"],
                 },
             },
             {
@@ -255,6 +283,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "sender_lid": _SENDER_LID_SCHEMA,
                         "target_lid": {
                             "type": "string",
                             "description": (
@@ -272,7 +301,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                             ),
                         },
                     },
-                    "required": ["target_lid"],
+                    "required": ["sender_lid", "target_lid"],
                 },
             },
             {
@@ -287,7 +316,11 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                     "the onboarding queue', etc. Super_admin only; the "
                     "tool re-checks authorization server-side."
                 ),
-                "inputSchema": {"type": "object", "properties": {}, "required": []},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"sender_lid": _SENDER_LID_SCHEMA},
+                    "required": ["sender_lid"],
+                },
             },
             {
                 "name": "add_to_allowlist",
@@ -307,6 +340,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "sender_lid": _SENDER_LID_SCHEMA,
                         "phone": {
                             "type": "string",
                             "description": (
@@ -324,7 +358,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                             ),
                         },
                     },
-                    "required": ["phone"],
+                    "required": ["sender_lid", "phone"],
                 },
             },
             {
@@ -343,6 +377,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "sender_lid": _SENDER_LID_SCHEMA,
                         "target_lid": {
                             "type": "string",
                             "description": (
@@ -384,7 +419,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                             ),
                         },
                     },
-                    "required": ["target_lid", "name", "role"],
+                    "required": ["sender_lid", "target_lid", "name", "role"],
                 },
             },
         ]
@@ -832,8 +867,6 @@ def _handle_tools_call(
     req: Dict[str, Any],
     scopes_data: Dict[str, Any],
     bearers: Dict[str, str],
-    sender_lid: str,
-    role: Optional[str],
     gbrain_url: str,
     timeout: float,
     scopes_yaml_path: str,
@@ -843,6 +876,33 @@ def _handle_tools_call(
     params = req.get("params") or {}
     name = str(params.get("name") or "")
     args = params.get("arguments") or {}
+
+    # v0.2: sender_lid is a REQUIRED per-call arg now (not a startup env var).
+    # Persona is responsible for passing the verified sender's lid here.
+    sender_lid = str(args.get("sender_lid") or "").strip()
+    if not _LID_RE.match(sender_lid):
+        _log(
+            "warn",
+            "tool call refused — sender_lid missing or malformed",
+            tool=name,
+            sender_lid_received=sender_lid or "(empty)",
+        )
+        return {
+            "isError": True,
+            "content": [{
+                "type": "text",
+                "text": (
+                    "sender_lid required: every hermes_save:* call must "
+                    "include the verified sender's lid (format "
+                    "`<digits>@lid`) as the `sender_lid` argument. "
+                    "Source it from the most recent <verified_sender "
+                    "id=\"...\"/> marker on the user's message; "
+                    "never invent it."
+                ),
+            }],
+        }
+    role = _resolve_role(scopes_data, sender_lid)
+
     if name == "approve_user":
         return _handle_approve_user(
             args, scopes_data, sender_lid, role, scopes_yaml_path,
@@ -1045,12 +1105,13 @@ def _write_error(req_id: Any, code: int, message: str) -> None:
 
 
 def main() -> int:
-    sender_lid = _env("HERMES_SENDER_LID") or ""
+    # v0.2: no per-session env. The server is launched ONCE by
+    # hermes-agent (via config.yaml mcp_servers) and stays up for the
+    # lifetime of the gateway. Every tool call carries its own
+    # sender_lid arg.
     scopes_yaml_path = _env("HERMES_SCOPES_YAML") or ""
-    bearers_path = _env("HERMES_BEARERS_FILE") or ""
-    gbrain_url = _env("HERMES_GBRAIN_URL") or ""
-    # Block D: WHATSAPP_ALLOWED_USERS lives in ~/.hermes/.env. Default points
-    # at the conventional path so the env var is optional.
+    bearers_path = _env("HERMES_BEARERS_FILE") or "/home/hermes-user/.hermes/role-bearers.json"
+    gbrain_url = _env("HERMES_GBRAIN_URL") or "http://127.0.0.1:7777"
     env_path = _env("HERMES_HERMES_ENV_PATH") or "/home/hermes-user/.hermes/.env"
     pending_path = _env("HERMES_PENDING_USERS_PATH") or _DEFAULT_PENDING_PATH
     timeout_str = _env("HERMES_GBRAIN_TIMEOUT") or "30"
@@ -1061,7 +1122,6 @@ def main() -> int:
 
     missing = [
         n for n, v in [
-            ("HERMES_SENDER_LID", sender_lid),
             ("HERMES_SCOPES_YAML", scopes_yaml_path),
             ("HERMES_BEARERS_FILE", bearers_path),
             ("HERMES_GBRAIN_URL", gbrain_url),
@@ -1069,20 +1129,19 @@ def main() -> int:
     ]
     if missing:
         _log("error", "required env vars missing — fail closed", missing=missing)
-        # Don't exit — claude-code-cli will spawn us anyway; emit a clear
-        # error on the first tool call so the bot surfaces it instead of
-        # hanging.
+        # Don't exit — hermes will spawn us anyway; emit a clear error on
+        # the first tool call so the bot surfaces it instead of hanging.
 
     scopes_data = _load_yaml(scopes_yaml_path) or {}
     bearers = _load_bearers(bearers_path) if bearers_path else {}
-    role = _resolve_role(scopes_data, sender_lid) if scopes_data and sender_lid else None
     _log(
         "info",
         "hermes-save MCP server started",
-        sender=sender_lid,
-        role=role,
         scopes=_scope_list(scopes_data),
         bearer_count=len(bearers),
+        bearer_scopes=sorted(bearers.keys()),
+        scopes_yaml=scopes_yaml_path,
+        bearers_file=bearers_path,
     )
 
     while True:
@@ -1099,16 +1158,21 @@ def main() -> int:
                 # No response for notifications.
                 continue
             elif method == "tools/list":
+                # Reload scopes.yaml per call so a prior approve_user is
+                # reflected in the enum lists. Cheap (small YAML).
+                scopes_data = _load_yaml(scopes_yaml_path) or scopes_data
                 _write_response(req_id, _handle_tools_list(scopes_data))
             elif method == "tools/call":
                 # Reload scopes.yaml per-call so a prior approve_user write
-                # is visible to subsequent calls in the same session.
+                # is visible to subsequent calls. Bearers file is also
+                # reloaded so a fetch-secrets refresh takes effect without
+                # a server restart.
                 scopes_data = _load_yaml(scopes_yaml_path) or scopes_data
-                role = _resolve_role(scopes_data, sender_lid) if scopes_data and sender_lid else role
+                bearers = _load_bearers(bearers_path) if bearers_path else bearers
                 _write_response(
                     req_id,
                     _handle_tools_call(
-                        req, scopes_data, bearers, sender_lid, role,
+                        req, scopes_data, bearers,
                         gbrain_url, timeout, scopes_yaml_path, env_path,
                         pending_path,
                     ),
