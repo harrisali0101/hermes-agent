@@ -1,30 +1,40 @@
-"""Block E gate — engage citation enforcement only when retrieval is in play.
+"""Block E gate — engage citation enforcement only on EXPLICIT user invocation.
 
 Public entrypoint:
   ``run_gate(user_message, response_text, sender_lid, agent_name,
              lookback_seconds) -> str``
 
-v0.2 decision tree (action-based, not topic-based):
+v0.3 decision tree (user-intent only — retrieval signal removed):
 
   1. If ``response_text`` is empty / pure metadata → pass-through.
-  2. Determine if THIS TURN involved retrieval:
-       a. ``user_requested_brain`` — classifier matched an explicit
-          brain-invocation pattern (the user said "search the brain",
-          "look it up in the docs", etc.)
-       b. ``retrieval_was_called`` — mcp_audit shows the bot actually
-          called a gbrain retrieval tool (query / search / get_page / …)
-       If neither is True → pass-through (this turn is general
-       assistance — the gate is not relevant).
-  3. If the bot's reply is an operational tool-result confirmation
-     ("phone added to allowlist", etc.) → pass-through.
-  4. Extract ``[slug]`` citations from the response.
-       a. Citations present → strip inline markers, append a clean
-          "Source(s):" footer.
-          - If ``user_requested_brain`` but NO retrieval call was made,
-            the citation is hallucinated → REFUSE.
-       b. No citations + self-refusal phrase ("not in the brain",
-          "I don't have information") → pass-through (honest non-answer).
-       c. No citations and no self-refusal → REFUSE.
+  2. If the user message is an operational/diagnostic request
+     ("list_pages", "approve user X", "run a health check",
+     "raw response of get_page") → pass-through. Tool output is the
+     expected reply; no citation required.
+  3. If the user did NOT explicitly invoke the brain → pass-through.
+     "Explicit invocation" means phrases like "search the brain",
+     "look it up in the docs/notes", "from gbrain", "in the memory",
+     etc. — the patterns in classifier._EXPLICIT_BRAIN_PATTERNS.
+     General questions, DIH-flavored conversational questions,
+     greetings, drafting, math, code, web — all pass through.
+  4. The user DID explicitly invoke the brain — gate engages:
+       a. If the bot's reply is an operational tool-result
+          confirmation → pass-through (no citation expected).
+       b. Extract ``[slug]`` citations from the response.
+          - Citations present → strip inline markers, append a clean
+            "Source(s):" footer.
+          - No citations + self-refusal phrase ("not in the brain",
+            "I don't have information") → pass-through (honest
+            non-answer).
+          - No citations and no self-refusal → REFUSE.
+
+Why retrieval-call was removed as an engagement signal: even with the
+operator persona rule "don't auto-retrieve", the model occasionally
+drifts and calls gbrain on a DIH-flavored conversational question.
+The user didn't ask for brain content, so refusing the answer for
+lack of citations is wrong — it surprises the user and looks broken.
+If the user wants brain-grounded answers they explicitly ask; if they
+don't, they get an unmoderated answer. Simpler mental model.
 
 Knobs:
   - ``HERMES_BLOCK_E_ENABLED`` (default on) — emergency off-switch.
@@ -49,7 +59,6 @@ from agent.block_e.classifier import (
     _looks_explicit_brain_invocation,
     _looks_operational_request,
 )
-from agent.block_e.mcp_audit import called_retrieval_tool, list_calls
 
 logger = logging.getLogger(__name__)
 
@@ -149,40 +158,33 @@ def run_gate(
     if not response_text or not response_text.strip():
         return response_text or ""
 
-    # v0.2.1: operational / diagnostic user requests are an ABSOLUTE
-    # pass-through. The user asked the bot to run an admin or debug tool
-    # ("list_pages with source=leadership", "approve user X", "run a
-    # health check", "tell me the raw response of get_page"). The bot's
-    # reply IS tool output, not a DIH knowledge claim. Retrieval tools
-    # WILL be called to satisfy the request — so the retrieval-call
-    # signal would otherwise spuriously engage the gate and refuse a
-    # legitimate diagnostic. Detected from the USER message, not the
-    # response, so the decision is robust to whatever shape the bot
-    # picks for its reply.
+    # v0.3: pass-through for operational / diagnostic user requests.
+    # The user asked the bot to run an admin or debug tool ("list_pages
+    # with source=leadership", "approve user X", "raw response of
+    # get_page"). The bot's reply IS tool output, not a knowledge claim.
     if _looks_operational_request(user_message or ""):
         logger.info(
-            "block_e: pass-through (operational/diagnostic request from user) "
+            "block_e: pass-through (operational/diagnostic request) "
             "| sender=%s len=%d",
             sender_lid, len(response_text),
         )
         return response_text
 
-    # Otherwise: two signals can engage the gate.
-    user_requested_brain = _looks_explicit_brain_invocation(user_message or "")
-    retrieval_was_called = False
-    if agent_name:
-        retrieval_was_called = called_retrieval_tool(agent_name, lookback_seconds)
-
-    if not user_requested_brain and not retrieval_was_called:
+    # v0.3: the gate engages ONLY on explicit user invocation of the
+    # brain. Retrieval-call signal removed — if the model auto-retrieves
+    # on a conversational question (persona drift), we don't punish the
+    # user; we let the answer through uncited rather than refuse it.
+    if not _looks_explicit_brain_invocation(user_message or ""):
         logger.info(
-            "block_e: pass-through (no brain invocation, no retrieval call) "
+            "block_e: pass-through (user did not explicitly invoke brain) "
             "| sender=%s len=%d",
             sender_lid, len(response_text),
         )
         return response_text
 
-    # Operational tool-result confirmation — pass-through regardless of
-    # which engagement signal fired.
+    # From here, the user explicitly asked the brain. Gate is engaged —
+    # the reply must either cite or honestly say "Not in the brain."
+
     if _looks_operational(response_text):
         logger.info(
             "block_e: pass-through (operational tool result) | sender=%s",
@@ -192,54 +194,28 @@ def run_gate(
 
     citations = extract_citations(response_text)
 
-    # No citations + honest self-refusal → pass-through.
     if not citations and _looks_like_self_refusal(response_text):
         logger.info(
-            "block_e: pass-through (self-refusal, no citation) | sender=%s "
-            "user_brain=%s retrieval=%s",
-            sender_lid, user_requested_brain, retrieval_was_called,
+            "block_e: pass-through (self-refusal, no citation) | sender=%s",
+            sender_lid,
         )
         return response_text
 
-    # No citations at all → REFUSE.
     if not citations:
-        calls_made: list[str] = []
-        if agent_name:
-            calls_made = list_calls(agent_name, lookback_seconds)
         logger.warning(
-            "block_e: REFUSE (no citation) | sender=%s agent=%s "
-            "user_brain=%s retrieval=%s calls=%s",
-            sender_lid, agent_name, user_requested_brain,
-            retrieval_was_called, calls_made,
+            "block_e: REFUSE (explicit brain invocation, no citation) "
+            "| sender=%s agent=%s",
+            sender_lid, agent_name,
         )
         if _dry_run():
             return response_text + "\n\n[gate would refuse: no citation]"
         return REFUSAL_MESSAGE
 
-    # Citations present. If the USER asked the brain but the model never
-    # actually retrieved, citations are hallucinated → REFUSE. (If the
-    # model retrieved without being asked, the citations are legitimate.)
-    if user_requested_brain and not retrieval_was_called:
-        logger.warning(
-            "block_e: REFUSE (user asked brain, citations without retrieval) "
-            "| sender=%s agent=%s citations=%d",
-            sender_lid, agent_name, len(citations),
-        )
-        if _dry_run():
-            return (
-                response_text
-                + "\n\n[gate would refuse: citations without retrieval call]"
-            )
-        return REFUSAL_MESSAGE
-
-    # PASS — strip inline brackets, append References footer.
     cleaned = strip_inline_citations(response_text)
     footer = format_references_footer(citations)
     logger.info(
-        "block_e: PASS | sender=%s agent=%s citations=%d "
-        "user_brain=%s retrieval=%s",
+        "block_e: PASS | sender=%s agent=%s citations=%d",
         sender_lid, agent_name, len(citations),
-        user_requested_brain, retrieval_was_called,
     )
     if footer:
         return cleaned.rstrip() + "\n\n" + footer
