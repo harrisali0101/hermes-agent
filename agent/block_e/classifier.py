@@ -80,8 +80,16 @@ _EXPLICIT_BRAIN_PATTERNS = [
     rf"\b{_BRAIN_VERBS}\b[^.?!\n]{{0,80}}?\b(in|on|inside|from|out\s+of|within)\s+(the\s+|our\s+|gbrain|dih'?s?\s+)?{_BRAIN_TARGET}\b",
     # "search/check/look in the brain (for X)"
     rf"\b{_BRAIN_VERBS}\b[^.?!\n]{{0,80}}?\bthe\s+{_BRAIN_TARGET}\b",
-    # "(from|in) the brain/notes/docs" as a standalone phrase
-    rf"\b(from|in|on|inside|within)\s+(the\s+|our\s+|gbrain|dih'?s?\s+)?{_BRAIN_TARGET}\b",
+    # "search memory" / "check brain" / "look up notes" — verb directly
+    # followed by target, no article. Catches the common chat shorthand.
+    rf"\b{_BRAIN_VERBS}\s+{_BRAIN_TARGET}\b",
+    # "from/in (the|our|dih's) brain/memory/notes/docs" — standalone phrase.
+    # Requires an article to disambiguate "from memory" (English idiom
+    # for "from recollection") from "from the memory" (gbrain reference).
+    rf"\b(from|in|on|inside|within)\s+(the|our|dih'?s?)\s+{_BRAIN_TARGET}\b",
+    # Same standalone phrase, but for distinctive identifiers that don't
+    # need an article ("from gbrain", "in the knowledge base", etc.).
+    r"\b(from|in|on|inside|within)\s+(gbrain|the\s+knowledge\s*base|the\s+data\s*store)\b",
     # "hermes, search/find/look …" — addressing the bot with a retrieval verb
     r"\bhermes,?\s+(search|find|look(\s+up)?|check|query|fetch|pull(\s+up)?|retrieve|dig(\s+up)?)\b",
     # "is X in the brain", "do we have X (in the brain|stored|on file)"
