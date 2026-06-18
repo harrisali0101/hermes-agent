@@ -259,6 +259,20 @@ def build_turn_context(
             should_review_memory = True
             agent._turns_since_memory = 0
 
+    # ── Verified-sender marker (provider-agnostic) ─────────────────────────
+    # Stamp the gateway-verified sender onto the API-bound user message so the
+    # persona resolves the role from scopes.yaml/ACCESS_POLICY. The claude_code
+    # runtime also wraps just-in-time (now idempotent), but the azure-foundry /
+    # default loop does NOT — without this, no platform turn carries the
+    # <verified_sender> marker and every sender falls to None tier. Only the API
+    # copy is wrapped; ``original_user_message`` (history/transcripts) stays clean.
+    if isinstance(user_message, str):
+        try:
+            from agent.claude_code_runtime import _wrap_with_verified_sender as _vs_wrap
+            user_message = _vs_wrap(agent, user_message)
+        except Exception:
+            logger.exception("verified_sender wrap failed in turn prologue")
+
     # Add user message.
     user_msg = {"role": "user", "content": user_message}
     messages.append(user_msg)

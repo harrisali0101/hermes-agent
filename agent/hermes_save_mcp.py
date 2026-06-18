@@ -401,12 +401,26 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                         },
                         "role": {
                             "type": "string",
-                            "enum": available_roles,
+                            "enum": available_roles + ["super_admin"],
                             "description": (
-                                "One of the roles defined in scopes.yaml. "
-                                "Determines which scopes the user can read "
-                                "and write to. See AGENTS.md for the role-"
-                                "to-scope mapping."
+                                "One of the roles defined in scopes.yaml, OR "
+                                "'super_admin' (high-privilege: reads every "
+                                "scope + onboarding/offboarding tools). "
+                                "Granting super_admin ALSO requires "
+                                "confirm_super_admin=true and a WhatsApp-"
+                                "resolved target lid. See AGENTS.md for the "
+                                "role-to-scope mapping."
+                            ),
+                        },
+                        "confirm_super_admin": {
+                            "type": "boolean",
+                            "description": (
+                                "Set true ONLY when role='super_admin' — an "
+                                "explicit acknowledgement you're minting a "
+                                "high-privilege super_admin. Ignored for normal "
+                                "roles. The server also requires the caller to "
+                                "be a super_admin and the target lid to be "
+                                "WhatsApp-resolved (no typos/guesses)."
                             ),
                         },
                         "platform": {
@@ -420,6 +434,93 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                         },
                     },
                     "required": ["sender_lid", "target_lid", "name", "role"],
+                },
+            },
+            {
+                "name": "list_allowlist",
+                "description": (
+                    "Show every phone number currently on the gateway "
+                    "allowlist (WHATSAPP_ALLOWED_USERS), with its audit memo "
+                    "and whether it's been onboarded to a role yet. Use when "
+                    "the Owner asks 'who's allowed', 'show the allowlist', "
+                    "'who can message the bot'. Super_admin only."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"sender_lid": _SENDER_LID_SCHEMA},
+                    "required": ["sender_lid"],
+                },
+            },
+            {
+                "name": "remove_from_allowlist",
+                "description": (
+                    "Remove a phone number from the gateway allowlist "
+                    "(WHATSAPP_ALLOWED_USERS in ~/.hermes/.env). The gateway "
+                    "loads the allowlist at startup, so a reload_gateway is "
+                    "required afterwards for the removal to take effect — this "
+                    "tool's result reminds you. Super_admin only."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sender_lid": _SENDER_LID_SCHEMA,
+                        "phone": {
+                            "type": "string",
+                            "description": (
+                                "Phone to remove, digits only, no '+' "
+                                "(e.g. 923338888888)."
+                            ),
+                        },
+                    },
+                    "required": ["sender_lid", "phone"],
+                },
+            },
+            {
+                "name": "revoke_user",
+                "description": (
+                    "Remove a user from scopes.yaml by lid (off-boarding). "
+                    "Takes effect on their next message (mtime reload, no "
+                    "restart). Removing a super_admin ALSO requires "
+                    "confirm_super_admin=true and is refused if it would leave "
+                    "zero super_admins. Super_admin caller only."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sender_lid": _SENDER_LID_SCHEMA,
+                        "target_lid": {
+                            "type": "string",
+                            "description": (
+                                "The lid to remove, format `<digits>@lid`."
+                            ),
+                        },
+                        "confirm_super_admin": {
+                            "type": "boolean",
+                            "description": (
+                                "Set true ONLY when the target is a "
+                                "super_admin — explicit acknowledgement of a "
+                                "high-privilege removal. Ignored for normal users."
+                            ),
+                        },
+                    },
+                    "required": ["sender_lid", "target_lid"],
+                },
+            },
+            {
+                "name": "reload_gateway",
+                "description": (
+                    "Restart the Hermes gateway so a just-changed allowlist "
+                    "(add_to_allowlist / remove_from_allowlist) takes effect "
+                    "— the allowlist is read only at gateway startup. Call "
+                    "this AFTER the Owner confirms, since it briefly drops the "
+                    "WhatsApp connection (~15-20s) and ends the current "
+                    "session. NOT needed for approve_user/revoke_user (those "
+                    "hot-reload via scopes.yaml mtime). Super_admin only."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"sender_lid": _SENDER_LID_SCHEMA},
+                    "required": ["sender_lid"],
                 },
             },
         ]
@@ -574,6 +675,200 @@ def _append_user_to_scopes_yaml(path: str, target_lid: str, name: str, role: str
     _atomic_write(path, new_text)
 
 
+def _append_super_admin_to_scopes_yaml(path: str, target_lid: str, name: str, sender_lid: str) -> None:
+    """Insert an entry into the `super_admins:` block (right after the header —
+    list order is irrelevant). Super_admins carry NO `role:` field. TEXT edit
+    preserves comments; the audit comment records who granted it and when."""
+    safe_name = name.replace('"', "'")
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    audit = f"  # SUPER_ADMIN_GRANT via /approve by {sender_lid} at {ts}"
+    entry = f'  - {{ id: "{target_lid}", name: "{safe_name}", platform: whatsapp }}'
+    with open(path, "r", encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    out: List[str] = []
+    inserted = False
+    for ln in lines:
+        out.append(ln)
+        if not inserted and ln.startswith("super_admins:"):
+            out.append(audit)
+            out.append(entry)
+            inserted = True
+    if not inserted:
+        raise RuntimeError("super_admins: section not found in scopes.yaml")
+    _atomic_write(path, "\n".join(out) + "\n")
+
+
+def _remove_super_admin_from_scopes_yaml(path: str, target_lid: str) -> bool:
+    """Remove a `super_admins:` entry by lid (a `- {` line with the id and NO
+    `role:` field — that's what distinguishes super_admins from users). Drops a
+    preceding SUPER_ADMIN_GRANT audit comment too. Returns True if removed."""
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    out: List[str] = []
+    removed = False
+    for ln in text.splitlines():
+        if (f'id: "{target_lid}"' in ln and "- {" in ln and "role:" not in ln):
+            removed = True
+            if out and out[-1].strip().startswith("# SUPER_ADMIN_GRANT"):
+                out.pop()
+            continue
+        out.append(ln)
+    if not removed:
+        return False
+    _atomic_write(path, "\n".join(out) + ("\n" if text.endswith("\n") else ""))
+    return True
+
+
+def _lid_is_known(session_dir: str, lid: str) -> bool:
+    """True if WhatsApp has resolved this lid (a lid-mapping file exists) — i.e.
+    the lid came from a real contact/message, not a typo/guess. Guards
+    super_admin grants against fabricated lids."""
+    digits = lid.split("@", 1)[0]
+    for suffix in ("_reverse.json", ".json"):
+        if os.path.exists(os.path.join(session_dir, f"lid-mapping-{digits}{suffix}")):
+            return True
+    return False
+
+
+def _count_super_admins(scopes_data: Dict[str, Any]) -> int:
+    return len([e for e in (scopes_data.get("super_admins") or []) if str(e.get("id", "")).strip()])
+
+
+def _read_allowlist(env_path: str) -> tuple[List[str], Dict[str, str]]:
+    """Return (phones, memos) parsed from the .env. `memos` maps phone → the
+    memo text from its `# … added via /allowlist: <phone> — <memo>` comment."""
+    phones: List[str] = []
+    memos: Dict[str, str] = {}
+    try:
+        with open(env_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except Exception:
+        return phones, memos
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith("WHATSAPP_ALLOWED_USERS="):
+            _, _, raw = ln.partition("=")
+            raw = raw.strip().strip('"').strip("'")
+            phones = [v.strip() for v in raw.split(",") if v.strip()]
+        elif s.startswith("#") and "added via /allowlist" in s:
+            after = s.split("added via /allowlist", 1)[1].lstrip(": ").strip()
+            if after:
+                head, _, memo = after.partition("—")
+                ph = (head.strip().split() or [""])[0]
+                if ph:
+                    memos[ph] = memo.strip()
+    return phones, memos
+
+
+def _remove_phone_from_allowlist(env_path: str, phone: str) -> bool:
+    """Remove `phone` from WHATSAPP_ALLOWED_USERS + drop its audit comment.
+    Returns True if removed, False if it wasn't present."""
+    with open(env_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    key = "WHATSAPP_ALLOWED_USERS"
+    removed = False
+    out: List[str] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if (s.startswith("#") and "added via /allowlist" in s
+                and re.search(rf"(?<!\d){re.escape(phone)}(?!\d)", s)):
+            continue  # drop this phone's audit comment
+        if s.startswith(key + "="):
+            _, _, raw = ln.partition("=")
+            current = [v.strip() for v in raw.strip().strip('"').strip("'").split(",") if v.strip()]
+            if phone in current:
+                removed = True
+                current = [p for p in current if p != phone]
+            out.append(f"{key}={','.join(current)}")
+            continue
+        out.append(ln)
+    if not removed:
+        return False
+    _atomic_write(env_path, "\n".join(out) + ("\n" if text.endswith("\n") else ""))
+    return True
+
+
+def _remove_user_from_scopes_yaml(path: str, target_lid: str) -> bool:
+    """Remove the `users:` entry whose id == target_lid (TEXT edit; preserves
+    comments). Drops a preceding `# added via /approve` audit line too. Only
+    matches lines that carry a `role:` field, so super_admins entries (which
+    have none) are never removed from chat. Returns True if removed."""
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    out: List[str] = []
+    removed = False
+    for ln in text.splitlines():
+        if (f'id: "{target_lid}"' in ln and "role:" in ln and "- {" in ln):
+            removed = True
+            if out and out[-1].strip().startswith("# added via /approve"):
+                out.pop()
+            continue
+        out.append(ln)
+    if not removed:
+        return False
+    _atomic_write(path, "\n".join(out) + ("\n" if text.endswith("\n") else ""))
+    return True
+
+
+def _phone_to_lid(session_dir: str, phone: str) -> Optional[str]:
+    """Resolve a phone → its WhatsApp lid via the bridge's reverse-mapping
+    files (`lid-mapping-<lid>_reverse.json` contains the phone). The lid is in
+    the filename. Returns `<digits>` or None."""
+    try:
+        for fn in os.listdir(session_dir):
+            if fn.startswith("lid-mapping-") and fn.endswith("_reverse.json"):
+                try:
+                    with open(os.path.join(session_dir, fn), "r", encoding="utf-8") as fh:
+                        if phone in fh.read():
+                            return fn[len("lid-mapping-"):-len("_reverse.json")]
+                except Exception:
+                    continue
+    except Exception:
+        return None
+    return None
+
+
+def _compute_pending(scopes_data: Dict[str, Any], env_path: str, session_dir: str) -> List[Dict[str, Any]]:
+    """Allowlisted phones whose resolved lid is NOT yet in scopes.yaml.
+    Independent of record_pending_user — surfaces a user even if the agent
+    never logged them. Returns [{phone, lid|None}]."""
+    phones, _memos = _read_allowlist(env_path)
+    known = _existing_lids(scopes_data)
+    out: List[Dict[str, Any]] = []
+    for ph in phones:
+        if ph == "*":
+            continue
+        lid_digits = _phone_to_lid(session_dir, ph)
+        lid = f"{lid_digits}@lid" if lid_digits else None
+        if lid and lid in known:
+            continue  # already onboarded
+        out.append({"phone": ph, "lid": lid})
+    return out
+
+
+def _session_dir_for(env_path: str) -> str:
+    """The bridge's WhatsApp session dir (holds the lid mappings), derived
+    from the .env location: <…/.hermes>/whatsapp/session."""
+    return os.path.join(os.path.dirname(env_path) or ".", "whatsapp", "session")
+
+
+def _restart_gateway_detached() -> bool:
+    """Restart hermes.service AFTER this response is flushed — detached + a
+    short delay so the MCP reply reaches the user before the gateway drops.
+    Uses passwordless `sudo -n systemctl restart hermes`."""
+    import subprocess
+    try:
+        subprocess.Popen(
+            ["bash", "-c", "sleep 3; sudo -n systemctl restart hermes"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception as exc:
+        _log("error", "restart_gateway spawn failed", error=str(exc))
+        return False
+
+
 def _handle_record_pending_user(
     args: Dict[str, Any],
     pending_path: str,
@@ -628,8 +923,13 @@ def _handle_list_pending_users(
     scopes_data: Dict[str, Any],
     sender_lid: str,
     pending_path: str,
+    env_path: str,
+    session_dir: str,
 ) -> Dict[str, Any]:
-    """Return the pending-users queue. Super_admin only."""
+    """Pending = the recorded queue UNION allowlisted numbers not yet in
+    scopes.yaml (computed, lid-resolved). The computed half is the robust fix:
+    it surfaces a user even if the agent never called record_pending_user.
+    Super_admin only."""
     if not _is_super_admin(scopes_data, sender_lid):
         _log("warn", "list_pending_users denied", sender=sender_lid)
         return {
@@ -638,21 +938,56 @@ def _handle_list_pending_users(
                 "Pending-users queue is restricted to super_admins."
             )}],
         }
-    entries = _load_pending(pending_path)
-    if not entries:
+    recorded = _load_pending(pending_path)
+    computed = _compute_pending(scopes_data, env_path, session_dir)
+
+    by_lid: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for e in recorded:
+        lid = e.get("lid")
+        if not lid:
+            continue
+        rec = by_lid.setdefault(lid, {"lid": lid})
+        rec["first_seen_at"] = e.get("first_seen_at")
+        rec["snippet"] = e.get("snippet")
+        if lid not in order:
+            order.append(lid)
+    no_lid_yet: List[Dict[str, Any]] = []
+    for c in computed:
+        lid = c.get("lid")
+        if lid:
+            rec = by_lid.setdefault(lid, {"lid": lid})
+            rec["phone"] = c.get("phone")
+            if lid not in order:
+                order.append(lid)
+        else:
+            no_lid_yet.append(c)
+
+    if not order and not no_lid_yet:
         return {"content": [{"type": "text", "text": (
-            "📭 No pending users. Either nobody new has messaged after "
-            "being allowlisted, or all pending users have been approved."
+            "📭 No pending users — everyone on the allowlist already has a "
+            "role in scopes.yaml, and nobody new is queued."
         )}]}
-    lines = [f"📋 {len(entries)} pending user(s):\n"]
-    for e in entries:
-        lid = e.get("lid", "<unknown>")
-        ts = e.get("first_seen_at", "<unknown>")
-        snip = e.get("snippet", "")
-        line = f"- `{lid}` — first seen {ts}"
+
+    lines = [f"📋 {len(order) + len(no_lid_yet)} pending:\n"]
+    for lid in order:
+        e = by_lid[lid]
+        line = "- `%s`" % lid
+        if e.get("phone"):
+            line += " (phone %s)" % e["phone"]
+        if e.get("first_seen_at"):
+            line += " — first seen %s" % e["first_seen_at"]
+        else:
+            line += " — allowlisted, not yet roled"
+        snip = e.get("snippet")
         if snip:
-            line += f' — "{snip[:80]}"'
+            line += ' — "%s"' % snip[:80]
         lines.append(line)
+    for c in no_lid_yet:
+        lines.append(
+            "- phone %s — allowlisted but hasn't messaged yet "
+            "(lid surfaces on first message)" % c["phone"]
+        )
     lines.append("\nApprove each with: `/approve <lid> as <role> name <name>`")
     return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
@@ -733,11 +1068,14 @@ def _handle_add_to_allowlist(
         f"✅ Phone added to gateway allowlist.\n\n"
         f"- phone: {phone}\n"
         + (f"- memo: {memo}\n\n" if memo else "\n")
-        + f"Next step: ask the new user to send any WhatsApp message to "
-        f"the bot. Hermes will surface their verified-sender `lid` in "
-        f"the journal. Run `/approve <lid> as <role> name <name>` to "
-        f"assign their role. Until then they're at None tier (general "
-        f"help only)."
+        + f"⚠️ IMPORTANT: the gateway only reads the allowlist at startup, so "
+        f"this number is NOT live yet — their messages will still be rejected. "
+        f"Confirm with the Owner, then call `reload_gateway` to restart the "
+        f"gateway (~15-20s) so the new number is accepted.\n\n"
+        f"After the reload: ask {phone} to send any WhatsApp message. Their "
+        f"verified `lid` then surfaces (and they show in `list_pending_users`). "
+        f"Run `approve_user` / `/approve <lid> as <role> name <name>` to assign "
+        f"their role. Until then they're at None tier (general help only)."
     )}]}
 
 
@@ -747,6 +1085,7 @@ def _handle_approve_user(
     sender_lid: str,
     role: Optional[str],
     scopes_yaml_path: str,
+    session_dir: str,
 ) -> Dict[str, Any]:
     target_lid = str(args.get("target_lid") or "").strip()
     name = str(args.get("name") or "").strip()
@@ -787,14 +1126,55 @@ def _handle_approve_user(
             )}],
         }
 
+    # ── super_admin: guarded chat path (decision 2026-06-18) ───────────────
+    # High-privilege. Caller is already super_admin (gated above). Extra rails:
+    # explicit confirm flag, the target lid must be WhatsApp-resolved (not a
+    # typo/guess), idempotency, and a distinct SUPER_ADMIN_GRANT audit line.
+    if requested_role == "super_admin":
+        if not bool(args.get("confirm_super_admin")):
+            return {"isError": True, "content": [{"type": "text", "text": (
+                "Granting super_admin is high-privilege — a super_admin reads "
+                "every scope, runs on/off-boarding, and can mint other "
+                "super_admins. Re-issue with confirm_super_admin=true to proceed."
+            )}]}
+        if not _lid_is_known(session_dir, target_lid):
+            return {"isError": True, "content": [{"type": "text", "text": (
+                f"Won't grant super_admin to {target_lid}: WhatsApp hasn't "
+                f"resolved this lid (no mapping on file), so it may be a typo "
+                f"or guess. Have them send one message first so the lid is "
+                f"verified, then retry."
+            )}]}
+        if _is_super_admin(scopes_data, target_lid):
+            return {"content": [{"type": "text", "text": (
+                f"{target_lid} is already a super_admin — no change."
+            )}]}
+        try:
+            _append_super_admin_to_scopes_yaml(scopes_yaml_path, target_lid, name, sender_lid)
+        except Exception as exc:
+            _log("error", "super_admin grant write failed", sender=sender_lid, target=target_lid, error=str(exc))
+            return {"isError": True, "content": [{"type": "text", "text": (
+                f"Failed to write scopes.yaml: {exc}. NOT granted."
+            )}]}
+        pending_path = os.environ.get("HERMES_PENDING_USERS_PATH") or _DEFAULT_PENDING_PATH
+        _remove_from_pending(pending_path, target_lid)
+        _log("warn", "SUPER_ADMIN_GRANT", sender=sender_lid, target_lid=target_lid, name=name)
+        return {"content": [{"type": "text", "text": (
+            f"✅ SUPER_ADMIN granted.\n\n"
+            f"- lid: `{target_lid}`\n- name: {name}\n- role: super_admin\n\n"
+            f"Effective on their next message (scopes.yaml mtime reload, no "
+            f"restart). Logged as SUPER_ADMIN_GRANT.\n\n"
+            f"Reminder: `scp /opt/hermes/workspace/scopes.yaml ./azure/config/` "
+            f"to keep the repo in sync."
+        )}]}
+
     available_roles = _role_list(scopes_data)
     if requested_role not in available_roles:
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
                 f"role '{requested_role}' is not defined in scopes.yaml. "
-                f"Allowed roles: {available_roles}. Promotion to super_admin "
-                f"is SSH-only — not via chat."
+                f"Allowed roles: {available_roles}. For super_admin, pass "
+                f"role='super_admin' with confirm_super_admin=true."
             )}],
         }
 
@@ -863,6 +1243,168 @@ def _handle_approve_user(
     }
 
 
+def _handle_list_allowlist(
+    scopes_data: Dict[str, Any],
+    sender_lid: str,
+    env_path: str,
+    session_dir: str,
+) -> Dict[str, Any]:
+    """Show the gateway allowlist with memo + onboarding status. Super_admin only."""
+    if not _is_super_admin(scopes_data, sender_lid):
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "The allowlist is restricted to super_admins."
+        )}]}
+    phones, memos = _read_allowlist(env_path)
+    known = _existing_lids(scopes_data)
+    if not phones:
+        return {"content": [{"type": "text", "text": "🔒 Allowlist is empty."}]}
+    lines = ["🔒 %d number(s) on the allowlist:\n" % len(phones)]
+    for ph in phones:
+        if ph == "*":
+            lines.append("- `*` — OPEN BOT (everyone allowed)")
+            continue
+        lid_digits = _phone_to_lid(session_dir, ph)
+        lid = ("%s@lid" % lid_digits) if lid_digits else None
+        if lid and lid in known:
+            status = "✅ onboarded"
+        elif lid:
+            status = "⏳ messaged, no role yet"
+        else:
+            status = "• not messaged yet"
+        line = "- `%s`" % ph
+        if memos.get(ph):
+            line += " — %s" % memos[ph]
+        line += "  [%s]" % status
+        lines.append(line)
+    return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+
+def _handle_remove_from_allowlist(
+    args: Dict[str, Any],
+    scopes_data: Dict[str, Any],
+    sender_lid: str,
+    env_path: str,
+) -> Dict[str, Any]:
+    """Remove a phone from the allowlist. Super_admin only. Needs reload_gateway."""
+    phone = str(args.get("phone") or "").strip().lstrip("+").replace(" ", "")
+    if not _is_super_admin(scopes_data, sender_lid):
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "The allowlist is restricted to super_admins."
+        )}]}
+    if not phone:
+        return {"isError": True, "content": [{"type": "text", "text": "phone is required."}]}
+    if not _PHONE_RE.match(phone):
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "phone format invalid: '%s'. Digits only, no '+'." % phone
+        )}]}
+    try:
+        removed = _remove_phone_from_allowlist(env_path, phone)
+    except Exception as exc:
+        _log("error", "remove_from_allowlist failed", sender=sender_lid, phone=phone, error=str(exc))
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "Failed to edit .env: %s. Check file permissions." % exc
+        )}]}
+    if not removed:
+        return {"content": [{"type": "text", "text": (
+            "📋 %s was not on the allowlist — nothing to remove." % phone
+        )}]}
+    _log("info", "remove_from_allowlist success", sender=sender_lid, phone=phone)
+    return {"content": [{"type": "text", "text": (
+        "✅ Removed %s from the allowlist.\n\n"
+        "⚠️ The gateway only reads the allowlist at startup, so this isn't "
+        "live yet. Confirm with the Owner, then call `reload_gateway` to "
+        "restart the gateway (~15-20s, ends this session) so the removal "
+        "takes effect." % phone
+    )}]}
+
+
+def _handle_revoke_user(
+    args: Dict[str, Any],
+    scopes_data: Dict[str, Any],
+    sender_lid: str,
+    scopes_yaml_path: str,
+    pending_path: str,
+) -> Dict[str, Any]:
+    """Remove a non-super_admin user from scopes.yaml. Super_admin only."""
+    target_lid = str(args.get("target_lid") or "").strip()
+    if not _is_super_admin(scopes_data, sender_lid):
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "Off-boarding is restricted to super_admins."
+        )}]}
+    if not _LID_RE.match(target_lid):
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "target_lid format invalid: '%s'. Expected `<digits>@lid`." % target_lid
+        )}]}
+    target_is_sa = _is_super_admin(scopes_data, target_lid)
+    if target_is_sa:
+        # Guarded super_admin removal (decision 2026-06-18).
+        if not bool(args.get("confirm_super_admin")):
+            return {"isError": True, "content": [{"type": "text", "text": (
+                "%s is a super_admin. Removing a super_admin is high-privilege "
+                "— re-issue with confirm_super_admin=true to proceed." % target_lid
+            )}]}
+        if _count_super_admins(scopes_data) <= 1:
+            return {"isError": True, "content": [{"type": "text", "text": (
+                "Refusing: %s is the LAST super_admin — removing it would lock "
+                "everyone out of admin ops. Add another super_admin first." % target_lid
+            )}]}
+    try:
+        if target_is_sa:
+            removed = _remove_super_admin_from_scopes_yaml(scopes_yaml_path, target_lid)
+        else:
+            removed = _remove_user_from_scopes_yaml(scopes_yaml_path, target_lid)
+    except Exception as exc:
+        _log("error", "revoke_user failed", sender=sender_lid, target=target_lid, error=str(exc))
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "Failed to edit scopes.yaml: %s. User NOT removed." % exc
+        )}]}
+    if not removed:
+        return {"content": [{"type": "text", "text": (
+            "📋 %s wasn't found in scopes.yaml — nothing to revoke." % target_lid
+        )}]}
+    _remove_from_pending(pending_path, target_lid)
+    _log(
+        "warn" if target_is_sa else "info",
+        "SUPER_ADMIN_REVOKE" if target_is_sa else "revoke_user success",
+        sender=sender_lid, target=target_lid,
+    )
+    kind = "SUPER_ADMIN" if target_is_sa else "user"
+    return {"content": [{"type": "text", "text": (
+        "✅ Revoked %s `%s` — removed from scopes.yaml. Takes effect on their "
+        "next message (mtime reload, no restart).%s\n\n"
+        "Note: the VM's scopes.yaml has diverged from the repo — Harris should "
+        "`scp /opt/hermes/workspace/scopes.yaml ./azure/config/` before the "
+        "next deploy. (Their allowlist entry, if any, is separate — use "
+        "`remove_from_allowlist` to drop that too.)" % (
+            kind, target_lid,
+            " Logged as SUPER_ADMIN_REVOKE." if target_is_sa else "",
+        )
+    )}]}
+
+
+def _handle_reload_gateway(
+    scopes_data: Dict[str, Any],
+    sender_lid: str,
+) -> Dict[str, Any]:
+    """Restart hermes so allowlist changes load. Super_admin only."""
+    if not _is_super_admin(scopes_data, sender_lid):
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "Restarting the gateway is restricted to super_admins."
+        )}]}
+    ok = _restart_gateway_detached()
+    if not ok:
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "Couldn't trigger the restart. Restart manually via SSH: "
+            "`sudo systemctl restart hermes`."
+        )}]}
+    _log("info", "reload_gateway triggered", sender=sender_lid)
+    return {"content": [{"type": "text", "text": (
+        "♻️ Restarting the gateway now — it reloads the allowlist on the way "
+        "back up (~15-20s). This session ends; send a new message once it's "
+        "reconnected and the latest allowlist will be in effect."
+    )}]}
+
+
 def _handle_tools_call(
     req: Dict[str, Any],
     scopes_data: Dict[str, Any],
@@ -903,16 +1445,29 @@ def _handle_tools_call(
         }
     role = _resolve_role(scopes_data, sender_lid)
 
+    session_dir = _session_dir_for(env_path)
     if name == "approve_user":
         return _handle_approve_user(
-            args, scopes_data, sender_lid, role, scopes_yaml_path,
+            args, scopes_data, sender_lid, role, scopes_yaml_path, session_dir,
         )
     if name == "add_to_allowlist":
         return _handle_add_to_allowlist(args, scopes_data, sender_lid, env_path)
     if name == "record_pending_user":
         return _handle_record_pending_user(args, pending_path)
     if name == "list_pending_users":
-        return _handle_list_pending_users(scopes_data, sender_lid, pending_path)
+        return _handle_list_pending_users(
+            scopes_data, sender_lid, pending_path, env_path, session_dir,
+        )
+    if name == "list_allowlist":
+        return _handle_list_allowlist(scopes_data, sender_lid, env_path, session_dir)
+    if name == "remove_from_allowlist":
+        return _handle_remove_from_allowlist(args, scopes_data, sender_lid, env_path)
+    if name == "revoke_user":
+        return _handle_revoke_user(
+            args, scopes_data, sender_lid, scopes_yaml_path, pending_path,
+        )
+    if name == "reload_gateway":
+        return _handle_reload_gateway(scopes_data, sender_lid)
     if name != "save_to_scope":
         return {
             "isError": True,
