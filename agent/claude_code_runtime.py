@@ -234,6 +234,10 @@ def _wrap_with_verified_sender(agent, user_text: str) -> str:
     runs, plugin tests, etc.) — the persona's "no verified sender = None tier"
     rule then applies.
     """
+    # Idempotent — the turn prologue (build_turn_context) now stamps the marker
+    # on every provider path; never double-wrap.
+    if user_text.lstrip().startswith("<verified_sender"):
+        return user_text
     user_id = str(getattr(agent, "_user_id", None) or "").strip()
     user_id_alt = str(getattr(agent, "_user_id_alt", None) or "").strip()
     platform = str(getattr(agent, "platform", None) or "").strip()
@@ -253,7 +257,33 @@ def _wrap_with_verified_sender(agent, user_text: str) -> str:
              .replace('"', "&quot;")
         )
 
+    # Resolve the sender's role from scopes.yaml (the single source of truth
+    # that approve_user/the MCP already write) and stamp it INTO the marker.
+    # This is what lets the persona map tier without a hardcoded lid table in
+    # ACCESS_POLICY.md — a chat-onboarded user is recognised the moment they're
+    # in scopes.yaml. role is None for None-tier senders → attr omitted.
+    try:
+        role = _resolve_role_for_sender(agent)
+    except Exception:
+        role = None
+    # Prefer the scopes.yaml name (set at approval — authoritative) over the
+    # user-controlled WhatsApp display name, so a nickname like "Alee" doesn't
+    # mask the onboarded identity "Hamza Ali Abbasi". Falls back to the WhatsApp
+    # name when the sender isn't in scopes (None tier).
+    try:
+        _sd = _load_scopes_yaml() or {}
+        for _sec in ("super_admins", "users"):
+            for _e in _sd.get(_sec) or []:
+                if str(_e.get("id", "")).strip() == user_id:
+                    _n = str(_e.get("name", "")).strip()
+                    if _n:
+                        user_name = _n
+                    break
+    except Exception:
+        pass
     attrs = f'id="{_esc(user_id)}" platform="{_esc(platform)}"'
+    if role:
+        attrs += f' role="{_esc(role)}"'
     if user_name:
         attrs += f' name="{_esc(user_name)}"'
     return f"<verified_sender {attrs}/>\n{user_text}"
