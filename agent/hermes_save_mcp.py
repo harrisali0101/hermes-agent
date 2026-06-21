@@ -507,6 +507,61 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 },
             },
             {
+                "name": "grant_scope_access",
+                "description": (
+                    "Grant a user read access to ONE additional scope "
+                    "beyond their role's baseline. Super_admin only. "
+                    "Adds a per-user `extra_reads` entry to scopes.yaml "
+                    "and re-syncs the gbrain subjects table so RLS picks "
+                    "up the new scope on the user's next message."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sender_lid": _SENDER_LID_SCHEMA,
+                        "target_lid": {
+                            "type": "string",
+                            "description": "The user receiving the grant (`<digits>@lid`).",
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": (
+                                "The scope id to grant (e.g. 'leadership', "
+                                "'finance', 'project_mesec'). Must be one "
+                                "of the scopes defined in scopes.yaml."
+                            ),
+                        },
+                    },
+                    "required": ["sender_lid", "target_lid", "scope"],
+                },
+            },
+            {
+                "name": "revoke_scope_access",
+                "description": (
+                    "Revoke a previously-granted extra scope from a user. "
+                    "Super_admin only. Only removes from `extra_reads` — "
+                    "if the scope is part of the user's role baseline, "
+                    "the call refuses with instructions to change the "
+                    "role instead (chat-driven role edits are out of "
+                    "scope for v1)."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sender_lid": _SENDER_LID_SCHEMA,
+                        "target_lid": {
+                            "type": "string",
+                            "description": "The user losing the grant (`<digits>@lid`).",
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "The scope id to revoke (must be in target's extra_reads).",
+                        },
+                    },
+                    "required": ["sender_lid", "target_lid", "scope"],
+                },
+            },
+            {
                 "name": "reload_gateway",
                 "description": (
                     "Restart the Hermes gateway so a just-changed allowlist "
@@ -869,6 +924,183 @@ def _restart_gateway_detached() -> bool:
         return False
 
 
+
+
+# ─── Per-user extra_reads (chat-driven scope grants) ───────────────────────
+# Adds / removes the optional `extra_reads: [scope_id]` field on a user
+# entry in scopes.yaml. We use ruamel.yaml round-trip mode so comments
+# above + alongside user entries are preserved across the edit — the
+# text-edit pattern the other helpers use can't safely insert into the
+# middle of an inline-mapping line like `- { id: ..., name: ..., role: ... }`.
+def _scopes_yaml_grant_extra_read(path: str, target_lid: str, scope_id: str) -> str:
+    """Add `scope_id` to target_lid's extra_reads in scopes.yaml.
+
+    Returns:
+        'added'      — scope appended to extra_reads (or extra_reads created)
+        'already'    — scope was already present in extra_reads
+        'role_baseline' — scope is part of target's role.reads (no-op grant)
+        'super_admin'   — target is super_admin (no-op grant, already god-mode)
+        'not_found'  — target lid not in users[] or super_admins[]
+        'unknown_scope' — scope_id not defined in scopes.yaml's scopes:
+    """
+    from ruamel.yaml import YAML
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.load(fh)
+    scopes_map = (data.get("scopes") or {})
+    if scope_id not in scopes_map:
+        return "unknown_scope"
+    # super_admin entries
+    for entry in (data.get("super_admins") or []):
+        if str(entry.get("id", "")).strip() == target_lid:
+            return "super_admin"
+    # user entries
+    users = data.get("users") or []
+    target_entry = None
+    for entry in users:
+        if str(entry.get("id", "")).strip() == target_lid:
+            target_entry = entry
+            break
+    if target_entry is None:
+        return "not_found"
+    # Is the scope already in the role's baseline?
+    role = str(target_entry.get("role", "")).strip()
+    role_reads = (((data.get("roles") or {}).get(role) or {}).get("reads") or [])
+    if "all" in role_reads or scope_id in role_reads:
+        return "role_baseline"
+    extra = target_entry.get("extra_reads")
+    if extra is None:
+        target_entry["extra_reads"] = [scope_id]
+    elif scope_id in extra:
+        return "already"
+    else:
+        extra.append(scope_id)
+    tmp = path + ".tmp-grant"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        yaml.dump(data, fh)
+    os.replace(tmp, path)
+    return "added"
+
+
+def _scopes_yaml_revoke_extra_read(path: str, target_lid: str, scope_id: str) -> str:
+    """Remove `scope_id` from target_lid's extra_reads.
+
+    Returns:
+        'removed'     — scope dropped from extra_reads
+        'not_in_extra' — scope wasn't in extra_reads (caller decides whether
+                         that's an error: e.g. baseline-revoke isn't supported)
+        'role_baseline' — scope is in role.reads, can't be revoked here
+        'super_admin'   — target is super_admin (revoke from super_admin
+                          status is a different op)
+        'not_found'   — target lid missing from users[]
+        'unknown_scope' — scope_id not defined
+    """
+    from ruamel.yaml import YAML
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    with open(path, "r", encoding="utf-8") as fh:
+        data = yaml.load(fh)
+    scopes_map = (data.get("scopes") or {})
+    if scope_id not in scopes_map:
+        return "unknown_scope"
+    for entry in (data.get("super_admins") or []):
+        if str(entry.get("id", "")).strip() == target_lid:
+            return "super_admin"
+    users = data.get("users") or []
+    target_entry = None
+    for entry in users:
+        if str(entry.get("id", "")).strip() == target_lid:
+            target_entry = entry
+            break
+    if target_entry is None:
+        return "not_found"
+    role = str(target_entry.get("role", "")).strip()
+    role_reads = (((data.get("roles") or {}).get(role) or {}).get("reads") or [])
+    if scope_id in role_reads or "all" in role_reads:
+        # In baseline; chat-driven revoke can't touch role config (that
+        # would affect every other user with the same role). Caller
+        # surfaces "change the role to revoke".
+        return "role_baseline"
+    extra = target_entry.get("extra_reads") or []
+    if scope_id not in extra:
+        return "not_in_extra"
+    extra.remove(scope_id)
+    # If extra_reads becomes empty, drop the key entirely to keep the
+    # yaml clean (matches how the file looked pre-grant).
+    if not extra:
+        target_entry.pop("extra_reads", None)
+    tmp = path + ".tmp-revoke"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        yaml.dump(data, fh)
+    os.replace(tmp, path)
+    return "removed"
+
+
+# ─── Subjects-table sync (RFC 8693 subject registry, gbrain v117) ──────────
+# Every chat-driven scopes.yaml edit (approve / revoke / grant / revoke
+# scope) must also propagate to gbrain's `subjects` table so the next
+# token-exchange call resolves the right `allowed_sources`. Without this
+# the SQL-layer RLS keeps using the pre-edit scope until someone re-runs
+# sync-subjects-to-gbrain.py by hand — the exact "scopes.yaml says one
+# thing, gbrain serves another" drift class.
+_SYNC_SUBJECTS_SCRIPT = "/datadrive/hermes/workspace/scripts/sync-subjects-to-gbrain.py"
+
+
+def _sync_subjects_to_gbrain(scopes_yaml_path: str) -> Optional[str]:
+    """Run the subjects sync. Returns None on success, or an error string.
+    NEVER raises — a sync failure must not mask the scopes.yaml write."""
+    import subprocess
+    if not os.path.exists(_SYNC_SUBJECTS_SCRIPT):
+        return (
+            f"subjects-sync script not found at {_SYNC_SUBJECTS_SCRIPT} — "
+            f"the gbrain subjects table was NOT updated. Run the sync "
+            f"manually so per-user RLS reflects the new scope state."
+        )
+    try:
+        proc = subprocess.run(
+            ["python3", _SYNC_SUBJECTS_SCRIPT, "--scopes-yaml", scopes_yaml_path],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "PATH": "/home/hermes-user/.bun/bin:" + os.environ.get("PATH", "")},
+        )
+    except subprocess.TimeoutExpired:
+        return "subjects sync timed out (>30s) — re-run manually."
+    except Exception as exc:
+        return f"subjects sync raised: {exc!r}"
+    if proc.returncode != 0:
+        return (
+            f"subjects sync exited {proc.returncode}: "
+            f"stderr={proc.stderr.strip()[:300]!r}"
+        )
+    return None
+
+
+def _remove_subject_from_gbrain(target_lid: str) -> Optional[str]:
+    """Soft-delete the subject row for `target_lid` in gbrain.
+    Returns None on success or an error string. NEVER raises."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["gbrain", "auth", "subjects", "remove", target_lid],
+            capture_output=True, text=True, timeout=15,
+            env={**os.environ, "PATH": "/home/hermes-user/.bun/bin:" + os.environ.get("PATH", "")},
+        )
+    except subprocess.TimeoutExpired:
+        return "gbrain subjects remove timed out (>15s)"
+    except FileNotFoundError:
+        return "gbrain CLI not found on PATH — subject row NOT soft-deleted"
+    except Exception as exc:
+        return f"gbrain subjects remove raised: {exc!r}"
+    if proc.returncode != 0:
+        return (
+            f"gbrain subjects remove exited {proc.returncode}: "
+            f"stderr={proc.stderr.strip()[:300]!r}"
+        )
+    return None
+
+
 def _handle_record_pending_user(
     args: Dict[str, Any],
     pending_path: str,
@@ -1158,8 +1390,10 @@ def _handle_approve_user(
         pending_path = os.environ.get("HERMES_PENDING_USERS_PATH") or _DEFAULT_PENDING_PATH
         _remove_from_pending(pending_path, target_lid)
         _log("warn", "SUPER_ADMIN_GRANT", sender=sender_lid, target_lid=target_lid, name=name)
+        _sync_err = _sync_subjects_to_gbrain(scopes_yaml_path)
+        _sync_note = f"\n\n⚠️ Subjects sync warning: {_sync_err}" if _sync_err else ""
         return {"content": [{"type": "text", "text": (
-            f"✅ SUPER_ADMIN granted.\n\n"
+            f"✅ SUPER_ADMIN granted.{_sync_note}\n\n"
             f"- lid: `{target_lid}`\n- name: {name}\n- role: super_admin\n\n"
             f"Effective on their next message (scopes.yaml mtime reload, no "
             f"restart). Logged as SUPER_ADMIN_GRANT.\n\n"
@@ -1217,6 +1451,8 @@ def _handle_approve_user(
     pending_path = os.environ.get("HERMES_PENDING_USERS_PATH") or _DEFAULT_PENDING_PATH
     _remove_from_pending(pending_path, target_lid)
 
+    _sync_err = _sync_subjects_to_gbrain(scopes_yaml_path)
+    _sync_note = f"\n\n⚠️ Subjects sync warning: {_sync_err}" if _sync_err else ""
     _log(
         "info",
         "approve_user success",
@@ -1232,7 +1468,7 @@ def _handle_approve_user(
             f"- lid: `{target_lid}`\n"
             f"- name: {name}\n"
             f"- role: {requested_role}\n"
-            f"- platform: {platform}\n\n"
+            f"- platform: {platform}{_sync_note}\n\n"
             f"The change takes effect immediately on their next message — "
             f"hermes reloads scopes.yaml when the file mtime advances. "
             f"No restart needed. Removed from pending queue if they were there.\n\n"
@@ -1363,6 +1599,12 @@ def _handle_revoke_user(
             "📋 %s wasn't found in scopes.yaml — nothing to revoke." % target_lid
         )}]}
     _remove_from_pending(pending_path, target_lid)
+    # Soft-delete the gbrain subject row so future token-exchange for this
+    # lid returns invalid_grant (subject no longer resolvable). Existing
+    # tokens already minted become invalid at next verify (gbrain joins
+    # subjects with deleted_at IS NULL — see verifyAccessToken).
+    _subject_err = _remove_subject_from_gbrain(target_lid)
+    _subject_note = f"\n\n⚠️ Subject soft-delete warning: {_subject_err}" if _subject_err else ""
     _log(
         "warn" if target_is_sa else "info",
         "SUPER_ADMIN_REVOKE" if target_is_sa else "revoke_user success",
@@ -1370,15 +1612,185 @@ def _handle_revoke_user(
     )
     kind = "SUPER_ADMIN" if target_is_sa else "user"
     return {"content": [{"type": "text", "text": (
-        "✅ Revoked %s `%s` — removed from scopes.yaml. Takes effect on their "
+        "✅ Revoked %s `%s` — removed from scopes.yaml.%s Takes effect on their "
         "next message (mtime reload, no restart).%s\n\n"
         "Note: the VM's scopes.yaml has diverged from the repo — Harris should "
         "`scp /opt/hermes/workspace/scopes.yaml ./azure/config/` before the "
         "next deploy. (Their allowlist entry, if any, is separate — use "
         "`remove_from_allowlist` to drop that too.)" % (
-            kind, target_lid,
+            kind, target_lid, _subject_note,
             " Logged as SUPER_ADMIN_REVOKE." if target_is_sa else "",
         )
+    )}]}
+
+
+
+def _handle_grant_scope_access(
+    args: Dict[str, Any],
+    scopes_data: Dict[str, Any],
+    sender_lid: str,
+    scopes_yaml_path: str,
+) -> Dict[str, Any]:
+    """Grant a user read access to one additional scope. Super_admin only.
+
+    Writes to scopes.yaml as a per-user `extra_reads` entry, then
+    re-syncs the gbrain subjects table so the new scope shows up in
+    the target's allowed_sources at the SQL-RLS layer on the next
+    token-exchange call. Role baseline reads are unchanged — this only
+    edits the per-user override list.
+    """
+    target_lid = str(args.get("target_lid") or "").strip()
+    scope_id = str(args.get("scope") or "").strip()
+    if not _is_super_admin(scopes_data, sender_lid):
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "Scope grants are restricted to super_admins. Your sender "
+            "identity does not have super_admin privileges."
+        )}]}
+    if not _LID_RE.match(target_lid):
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"target_lid format invalid: '{target_lid}'. Expected `<digits>@lid`."
+        )}]}
+    if not scope_id:
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "scope is required (e.g. 'leadership', 'finance', 'project_mesec')."
+        )}]}
+    try:
+        result = _scopes_yaml_grant_extra_read(scopes_yaml_path, target_lid, scope_id)
+    except Exception as exc:
+        _log("error", "grant_scope_access write failed",
+             sender=sender_lid, target=target_lid, scope=scope_id, error=str(exc))
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"Failed to edit scopes.yaml: {exc}. No grant applied."
+        )}]}
+
+    if result == "unknown_scope":
+        available = sorted((scopes_data.get("scopes") or {}).keys())
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"scope '{scope_id}' is not defined in scopes.yaml. "
+            f"Available scopes: {available}."
+        )}]}
+    if result == "not_found":
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"User {target_lid} is not in scopes.yaml. Onboard them first "
+            f"via approve_user, then re-issue the grant."
+        )}]}
+    if result == "super_admin":
+        return {"content": [{"type": "text", "text": (
+            f"{target_lid} is a super_admin and already has access to every scope. "
+            f"No grant needed."
+        )}]}
+    if result == "role_baseline":
+        role = ""
+        for e in (scopes_data.get("users") or []):
+            if str(e.get("id", "")).strip() == target_lid:
+                role = str(e.get("role", "")).strip()
+                break
+        return {"content": [{"type": "text", "text": (
+            f"{target_lid}'s role ('{role}') already includes '{scope_id}' in its "
+            f"baseline reads. No grant needed."
+        )}]}
+    if result == "already":
+        return {"content": [{"type": "text", "text": (
+            f"{target_lid} already has '{scope_id}' in their extra_reads. No change."
+        )}]}
+    # result == "added"
+    sync_err = _sync_subjects_to_gbrain(scopes_yaml_path)
+    sync_note = (f"\n\n⚠️ Subjects sync warning: {sync_err}" if sync_err else "")
+    _log("info", "grant_scope_access",
+         sender=sender_lid, target=target_lid, scope=scope_id)
+    return {"content": [{"type": "text", "text": (
+        f"✅ Granted `{scope_id}` read access to `{target_lid}`.{sync_note}\n\n"
+        f"Effective on their next message (gbrain RLS re-resolves on each "
+        f"token-exchange). Stored as `extra_reads` in scopes.yaml so it "
+        f"survives role changes.\n\n"
+        f"Note: the VM's scopes.yaml has diverged from the repo — Harris "
+        f"should `scp /opt/hermes/workspace/scopes.yaml ./azure/config/` "
+        f"before the next deploy."
+    )}]}
+
+
+def _handle_revoke_scope_access(
+    args: Dict[str, Any],
+    scopes_data: Dict[str, Any],
+    sender_lid: str,
+    scopes_yaml_path: str,
+) -> Dict[str, Any]:
+    """Revoke one extra scope from a user. Super_admin only.
+
+    Only removes from `extra_reads`. If the scope is part of the role's
+    baseline reads, the request is refused with instructions to change
+    the user's role instead — chat-driven role-config edits are out of
+    scope for v1 (they'd ripple to every user with that role).
+    """
+    target_lid = str(args.get("target_lid") or "").strip()
+    scope_id = str(args.get("scope") or "").strip()
+    if not _is_super_admin(scopes_data, sender_lid):
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "Scope revokes are restricted to super_admins."
+        )}]}
+    if not _LID_RE.match(target_lid):
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"target_lid format invalid: '{target_lid}'."
+        )}]}
+    if not scope_id:
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "scope is required."
+        )}]}
+    try:
+        result = _scopes_yaml_revoke_extra_read(scopes_yaml_path, target_lid, scope_id)
+    except Exception as exc:
+        _log("error", "revoke_scope_access write failed",
+             sender=sender_lid, target=target_lid, scope=scope_id, error=str(exc))
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"Failed to edit scopes.yaml: {exc}. No revoke applied."
+        )}]}
+
+    if result == "unknown_scope":
+        available = sorted((scopes_data.get("scopes") or {}).keys())
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"scope '{scope_id}' is not defined in scopes.yaml. Available: {available}."
+        )}]}
+    if result == "not_found":
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"User {target_lid} is not in scopes.yaml."
+        )}]}
+    if result == "super_admin":
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"{target_lid} is a super_admin — their scope access comes from "
+            f"super_admin status, not extra_reads. To remove their access, use "
+            f"revoke_user (will demote and trigger the soft-delete on their "
+            f"subjects row)."
+        )}]}
+    if result == "role_baseline":
+        role = ""
+        for e in (scopes_data.get("users") or []):
+            if str(e.get("id", "")).strip() == target_lid:
+                role = str(e.get("role", "")).strip()
+                break
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"`{scope_id}` is part of `{target_lid}`'s role ('{role}') baseline "
+            f"reads — chat-driven revoke can't touch role definitions (would "
+            f"ripple to every user with that role). To remove this access, "
+            f"revoke_user and re-approve with a narrower role, or edit "
+            f"scopes.yaml's roles: section by hand."
+        )}]}
+    if result == "not_in_extra":
+        return {"content": [{"type": "text", "text": (
+            f"`{target_lid}` doesn't have `{scope_id}` as an extra_read — "
+            f"nothing to revoke."
+        )}]}
+    # result == "removed"
+    sync_err = _sync_subjects_to_gbrain(scopes_yaml_path)
+    sync_note = (f"\n\n⚠️ Subjects sync warning: {sync_err}" if sync_err else "")
+    _log("info", "revoke_scope_access",
+         sender=sender_lid, target=target_lid, scope=scope_id)
+    return {"content": [{"type": "text", "text": (
+        f"✅ Revoked `{scope_id}` extra read from `{target_lid}`.{sync_note}\n\n"
+        f"Effective on their next message. Their role baseline reads are "
+        f"unchanged.\n\n"
+        f"Note: the VM's scopes.yaml has diverged from the repo — Harris should "
+        f"`scp /opt/hermes/workspace/scopes.yaml ./azure/config/` before the "
+        f"next deploy."
     )}]}
 
 
@@ -1466,6 +1878,10 @@ def _handle_tools_call(
         return _handle_revoke_user(
             args, scopes_data, sender_lid, scopes_yaml_path, pending_path,
         )
+    if name == "grant_scope_access":
+        return _handle_grant_scope_access(args, scopes_data, sender_lid, scopes_yaml_path)
+    if name == "revoke_scope_access":
+        return _handle_revoke_scope_access(args, scopes_data, sender_lid, scopes_yaml_path)
     if name == "reload_gateway":
         return _handle_reload_gateway(scopes_data, sender_lid)
     if name != "save_to_scope":

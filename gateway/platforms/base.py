@@ -2384,8 +2384,15 @@ class BasePlatformAdapter(ABC):
         if not isinstance(event, ToolCallChunk):
             return None
 
-        from agent.display import get_tool_emoji
+        from agent.display import (
+            get_tool_emoji,
+            get_tool_friendly_label,
+            format_friendly_preview,
+        )
         emoji = get_tool_emoji(event.tool_name, default="⚙️")
+        # CEO-friendly label for chat. Falls back to raw tool name when no
+        # mapping exists, so unmapped tools degrade to the previous behavior.
+        label = get_tool_friendly_label(event.tool_name)
 
         if mode == "verbose":
             if event.args:
@@ -2393,20 +2400,23 @@ class BasePlatformAdapter(ABC):
                 args_str = json.dumps(event.args, ensure_ascii=False, default=str)
                 if preview_max_len > 0 and len(args_str) > preview_max_len:
                     args_str = args_str[:preview_max_len - 3] + "..."
-                return f"{emoji} {event.tool_name}({list(event.args.keys())})\n{args_str}"
+                # Verbose mode is for operators — keep raw tool name +
+                # friendly label so debug context survives.
+                return f"{emoji} {label} [{event.tool_name}]({list(event.args.keys())})\n{args_str}"
             if event.preview:
-                return f"{emoji} {event.tool_name}: \"{event.preview}\""
-            return f"{emoji} {event.tool_name}..."
+                friendly = format_friendly_preview(event.tool_name, event.preview)
+                return f"{emoji} {label} [{event.tool_name}]: \"{friendly}\""
+            return f"{emoji} {label} [{event.tool_name}]..."
 
         # "all" / "new": short preview, capped (default 40 to keep gateway
         # progress bubbles compact — they persist as permanent messages).
-        preview = event.preview
+        preview = format_friendly_preview(event.tool_name, event.preview)
         if preview:
             cap = preview_max_len if preview_max_len > 0 else 40
             if len(preview) > cap:
                 preview = preview[:cap - 3] + "..."
-            return f"{emoji} {event.tool_name}: \"{preview}\""
-        return f"{emoji} {event.tool_name}..."
+            return f"{emoji} {label}: \"{preview}\""
+        return f"{emoji} {label}..."
 
     @property
     def has_fatal_error(self) -> bool:

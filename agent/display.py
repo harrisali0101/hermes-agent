@@ -160,6 +160,105 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
     return default
 
 
+# Friendly tool-progress labels for non-technical users (WhatsApp / Slack /
+# Telegram). Maps raw tool names like ``mcp_gbrain_get_recent_salience`` to
+# human-readable verbs like ``"Checking what's new"``. Used by the gateway
+# tool-progress renderer (gateway/platforms/base.py format_tool_progress).
+#
+# Keep keys in this dict aligned with the actual exposed tool names. When
+# adding a new MCP server or a new built-in tool, drop a friendly label
+# here so its progress lines stay readable in chat. Anything unmapped
+# falls back to the raw tool name.
+_TOOL_FRIENDLY_LABELS: dict[str, str] = {
+    # gbrain MCP server (legacy shared-bearer)
+    "mcp_gbrain_query":                 "Searching the brain",
+    "mcp_gbrain_search":                "Searching the brain (keywords)",
+    "mcp_gbrain_get_recent_salience":   "Checking what's new",
+    "mcp_gbrain_list_pages":            "Listing recent documents",
+    "mcp_gbrain_get_page":              "Reading the document",
+    "mcp_gbrain_get_chunks":            "Pulling sections",
+    "mcp_gbrain_put_page":              "Saving to the brain",
+    "mcp_gbrain_find_experts":          "Finding who knows this",
+    # hermes_read MCP server (per-subject RFC 8693 reads)
+    "mcp_hermes_read_query":            "Searching the brain",
+    "mcp_hermes_read_search":           "Searching the brain (keywords)",
+    "mcp_hermes_read_get_page":         "Reading the document",
+    "mcp_hermes_read_list_pages":       "Listing recent documents",
+    # hermes_save MCP server (write + admin)
+    "mcp_hermes_save_save_to_scope":         "Saving to the brain",
+    "mcp_hermes_save_add_to_allowlist":      "Adding user to allowlist",
+    "mcp_hermes_save_approve_user":          "Approving user",
+    "mcp_hermes_save_record_pending_user":   "Recording pending user",
+    "mcp_hermes_save_list_pending_users":    "Checking pending users",
+    "mcp_hermes_save_list_allowlist":        "Checking the allowlist",
+    "mcp_hermes_save_remove_from_allowlist": "Removing from allowlist",
+    "mcp_hermes_save_revoke_user":           "Revoking user",
+    "mcp_hermes_save_reload_gateway":        "Reloading the gateway",
+    # Built-in file / shell tools
+    "read_file":            "Reading the file",
+    "write_file":           "Writing to file",
+    "edit_file":            "Editing the file",
+    "patch":                "Patching the file",
+    "search_files":         "Searching files",
+    "list_files":           "Listing files",
+    "terminal":             "Running a command",
+    "bash":                 "Running a command",
+    "process":              "Managing a process",
+    # Web + research
+    "web_search":           "Searching the web",
+    "web_fetch":            "Fetching webpage",
+    "web_extract":          "Extracting from webpage",
+    "deep_research":        "Doing deep research",
+    # Reasoning + planning
+    "think":                "Thinking through this",
+    "clarify":              "Asking for clarification",
+    "delegate_task":        "Delegating a sub-task",
+    # Media
+    "image_generate":       "Generating an image",
+    "vision_analyze":       "Analysing the image",
+    "text_to_speech":       "Generating voice reply",
+    # Skills
+    "skill_view":           "Looking up a skill",
+    "skills_list":          "Listing skills",
+    "skill_manage":         "Managing a skill",
+}
+
+
+def get_tool_friendly_label(tool_name: str) -> str:
+    """Return a CEO-friendly label for a tool name, or the raw tool name
+    when no mapping exists.
+
+    Used by gateway tool-progress rendering so chat users see
+    ``"Searching the brain"`` instead of ``"mcp_gbrain_query"``.
+    The raw name is the safe fallback — a missing mapping degrades
+    to the previous display, not to an error.
+    """
+    return _TOOL_FRIENDLY_LABELS.get(tool_name, tool_name)
+
+
+def format_friendly_preview(tool_name: str, raw_preview: str | None) -> str | None:
+    """Tighten the per-call preview for non-technical display.
+
+    The gateway's default preview is the first ~40 chars of the primary
+    arg. For most tools that's fine (a query string, a page slug). For
+    file paths it leaks a full absolute path like
+    ``/datadrive/hermes/workspace/rules/STATUS_QUERY.md`` — keep just
+    the filename. The persona's narrator lines already describe the
+    intent in plain English; the preview only needs to disambiguate
+    between concurrent same-tool calls.
+    """
+    if not raw_preview:
+        return raw_preview
+    # File-path tools: show just the basename, drop the absolute path noise.
+    if tool_name in {"read_file", "write_file", "edit_file", "patch", "list_files"}:
+        # Path may have been pre-truncated with "..." — strip dirs only if
+        # we still have a real basename after the last "/".
+        from pathlib import Path
+        basename = Path(raw_preview).name
+        return basename or raw_preview
+    return raw_preview
+
+
 # =========================================================================
 # Tool preview (one-line summary of a tool call's primary argument)
 # =========================================================================
