@@ -12997,9 +12997,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             last_tool[0] = tool_name
             
-            # Build progress message with primary argument preview
-            from agent.display import get_tool_emoji
+            # Build progress message with primary argument preview.
+            # CEO-friendly: get_tool_friendly_label maps raw tool names
+            # (e.g. mcp_gbrain_query) to plain-English labels ("Searching
+            # the brain"); format_friendly_preview trims file paths to
+            # the basename so /datadrive/.../STATUS_QUERY.md displays as
+            # "STATUS_QUERY.md". Both fall back to the raw value when no
+            # mapping is defined, so unmapped tools degrade safely.
+            from agent.display import (
+                get_tool_emoji,
+                get_tool_friendly_label,
+                format_friendly_preview,
+            )
             emoji = get_tool_emoji(tool_name, default="⚙️")
+            label = get_tool_friendly_label(tool_name)
 
             # Markdown-capable platforms render a terminal command as a fenced
             # code block instead of the compact `terminal: "cmd…"` preview.
@@ -13056,11 +13067,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # detail.  Platform message-length limits handle the rest.
                     if _pl > 0 and len(args_str) > _pl:
                         args_str = args_str[:_pl - 3] + "..."
-                    msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                    msg = f"{emoji} {label} [{tool_name}]({list(args.keys())})\n{args_str}"
                 elif preview:
-                    msg = f"{emoji} {tool_name}: \"{preview}\""
+                    _friendly_v = format_friendly_preview(tool_name, preview) or preview
+                    msg = f"{emoji} {label}: \"{_friendly_v}\""
                 else:
-                    msg = f"{emoji} {tool_name}..."
+                    msg = f"{emoji} {label}..."
                 progress_queue.put(msg)
                 return
             
@@ -13075,11 +13087,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from agent.display import get_tool_preview_max_len
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
-                if len(preview) > _cap:
-                    preview = preview[:_cap - 3] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+                # Trim path noise first (e.g. /datadrive/.../STATUS_QUERY.md
+                # → STATUS_QUERY.md), then apply the length cap.
+                _friendly = format_friendly_preview(tool_name, preview) or preview
+                if len(_friendly) > _cap:
+                    _friendly = _friendly[:_cap - 3] + "..."
+                msg = f"{emoji} {label}: \"{_friendly}\""
             else:
-                msg = f"{emoji} {tool_name}..."
+                msg = f"{emoji} {label}..."
             
             # Dedup: collapse consecutive identical progress messages.
             # Common with execute_code where models iterate with the same
