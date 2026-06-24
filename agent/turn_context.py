@@ -260,40 +260,20 @@ def build_turn_context(
             agent._turns_since_memory = 0
 
     # ── Verified-sender marker (provider-agnostic) ─────────────────────────
-    # Stamp the gateway-verified sender onto the API-bound user message so the
-    # persona resolves the role from scopes.yaml/ACCESS_POLICY. The claude_code
-    # runtime also wraps just-in-time (now idempotent), but the azure-foundry /
-    # default loop does NOT — without this, no platform turn carries the
-    # <verified_sender> marker and every sender falls to None tier. Only the API
-    # copy is wrapped; ``original_user_message`` (history/transcripts) stays clean.
-    if isinstance(user_message, str):
-        try:
-            from agent.claude_code_runtime import _wrap_with_verified_sender as _vs_wrap
-            user_message = _vs_wrap(agent, user_message)
-        except Exception:
-            logger.exception("verified_sender wrap failed in turn prologue")
+    # The marker is stamped onto the API-bound copy of the user message in
+    # ``conversation_loop`` during api_messages assembly — NOT here. Stamping
+    # at the messages-list level conflicts with the persist_user_message
+    # override (run_agent._apply_persist_user_message_override mutates
+    # messages[idx]["content"] back to the clean transcript text inside
+    # ``_persist_session`` at the early crash-resilience checkpoint just
+    # below). Keeping the wrap in api_messages assembly means transcripts
+    # stay clean AND the model still receives the marker every turn.
 
     # Add user message.
     user_msg = {"role": "user", "content": user_message}
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
-
-    # TEMP DIAG (2026-06-24): confirm the WRAPPED content is in messages
-    # at the just-appended index. If this prints the marker but the
-    # post-build_turn_context diag in conversation_loop sees unwrapped,
-    # something between here and the return overwrites it.
-    try:
-        _appended = messages[current_turn_user_idx].get("content", "")
-        if isinstance(_appended, str):
-            logger.warning(
-                "POST-append messages[%d] head: %r (user_message head: %r)",
-                current_turn_user_idx,
-                _appended[:220],
-                user_message[:220] if isinstance(user_message, str) else type(user_message).__name__,
-            )
-    except Exception:
-        pass
 
     if not agent.quiet_mode:
         _print_preview = summarize_user_message_for_log(user_message)

@@ -242,18 +242,11 @@ def _wrap_with_verified_sender(agent, user_text: str) -> str:
     user_id_alt = str(getattr(agent, "_user_id_alt", None) or "").strip()
     platform = str(getattr(agent, "platform", None) or "").strip()
     user_name = str(getattr(agent, "_user_name", None) or "").strip()
-    # Temporarily promoted to WARNING (2026-06-24) to debug a missing-
-    # marker incident on WhatsApp Cloud. Demote back to INFO once the
-    # diagnostic is closed.
-    logger.warning(
-        "verified_sender wrap: platform=%r user_id=%r user_id_alt=%r name=%r text_head=%r",
-        platform, user_id, user_id_alt, user_name, user_text[:60],
+    logger.info(
+        "verified_sender wrap: platform=%r user_id=%r user_id_alt=%r name=%r",
+        platform, user_id, user_id_alt, user_name,
     )
     if not user_id or not platform or platform == "cli":
-        logger.warning(
-            "verified_sender wrap: SKIPPED (user_id=%r platform=%r)",
-            user_id, platform,
-        )
         return user_text
 
     def _esc(s: str) -> str:

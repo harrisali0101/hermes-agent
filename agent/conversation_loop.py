@@ -553,22 +553,6 @@ def run_conversation(
     messages = _ctx.messages
     conversation_history = _ctx.conversation_history
 
-    # TEMP DIAG (2026-06-24): probe whether the wrap marker actually
-    # survived turn_context — checks the just-appended user message.
-    try:
-        for _diag_i in range(len(messages) - 1, -1, -1):
-            _diag_m = messages[_diag_i]
-            if isinstance(_diag_m, dict) and _diag_m.get("role") == "user":
-                _diag_c = _diag_m.get("content", "")
-                if isinstance(_diag_c, str):
-                    logger.warning(
-                        "POST-build_turn_context messages[%d] user content head: %r (current_turn_user_idx=%r, _ctx.user_message head=%r)",
-                        _diag_i, _diag_c[:220], _ctx.current_turn_user_idx,
-                        _ctx.user_message[:220] if isinstance(_ctx.user_message, str) else type(_ctx.user_message).__name__,
-                    )
-                break
-    except Exception as _e:
-        logger.warning("POST-build_turn_context diag failed: %s", _e)
     active_system_prompt = _ctx.active_system_prompt
     effective_task_id = _ctx.effective_task_id
     turn_id = _ctx.turn_id
@@ -771,11 +755,32 @@ def run_conversation(
             api_msg = msg.copy()
 
             # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated, so nothing leaks into session persistence.
+            # Sources: verified_sender marker + memory manager prefetch +
+            # plugin pre_llm_call hooks with target="user_message" (the
+            # default). All are API-call-time only — the original message in
+            # `messages` is never mutated, so nothing leaks into session
+            # persistence (transcripts stay clean even when the operator's
+            # ``persist_user_message`` override would also clean them).
             if idx == current_turn_user_idx and msg.get("role") == "user":
+                # Verified-sender marker (provider-agnostic). Stamped at
+                # api_messages assembly — NOT in turn_context — because
+                # ``_apply_persist_user_message_override`` mutates
+                # messages[idx]["content"] back to the clean transcript
+                # text inside the early crash-resilience persistence at
+                # turn_context.py:297. Applying the wrap here means the
+                # marker reaches the model without conflicting with that
+                # transcript-cleanup pass.
+                _base = api_msg.get("content", "")
+                if isinstance(_base, str):
+                    try:
+                        from agent.claude_code_runtime import _wrap_with_verified_sender as _vs_wrap
+                        _wrapped = _vs_wrap(agent, _base)
+                        if _wrapped is not _base:
+                            api_msg["content"] = _wrapped
+                            _base = _wrapped
+                    except Exception:
+                        logger.exception("verified_sender wrap failed in api_messages assembly")
+
                 _injections = []
                 if _ext_prefetch_cache:
                     _fenced = build_memory_context_block(_ext_prefetch_cache)
@@ -784,7 +789,6 @@ def run_conversation(
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
                 if _injections:
-                    _base = api_msg.get("content", "")
                     if isinstance(_base, str):
                         api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
 
@@ -831,28 +835,6 @@ def run_conversation(
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
-
-        # TEMP DIAGNOSTIC (2026-06-24): dump the last user message content
-        # to verify the <verified_sender> marker is present in what reaches
-        # the API. Remove once the missing-marker incident is root-caused.
-        try:
-            for _i in range(len(api_messages) - 1, -1, -1):
-                _m = api_messages[_i]
-                if isinstance(_m, dict) and _m.get("role") == "user":
-                    _c = _m.get("content", "")
-                    if isinstance(_c, str):
-                        logger.warning(
-                            "API user-msg head (first 220 chars): %r",
-                            _c[:220],
-                        )
-                    elif isinstance(_c, list):
-                        logger.warning(
-                            "API user-msg content-list types: %r",
-                            [type(_b).__name__ + ":" + str(_b.get("type") if isinstance(_b, dict) else "?") for _b in _c],
-                        )
-                    break
-        except Exception as _diag_err:
-            logger.warning("API user-msg diag failed: %s", _diag_err)
 
         # Inject ephemeral prefill messages right after the system prompt
         # but before conversation history. Same API-call-time-only pattern.
