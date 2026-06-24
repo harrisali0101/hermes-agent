@@ -5,7 +5,7 @@ either backed by a `[slug]` citation OR the bot explicitly says "Not in the
 brain". A soft-fabricated DIH claim ("there is a note touching on it…"
 without an MCP call) is replaced with a transparent refusal message.
 
-Public entry: ``run_gate(user_message, response_text, sender_lid, oauth_agent_name)
+Public entry: ``run_gate(user_message, response_text, sender_id, oauth_agent_name)
 -> str`` — call from ``claude_code_runtime`` as a response-transform step.
 """
 

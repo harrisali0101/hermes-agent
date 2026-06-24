@@ -2,12 +2,12 @@
 
 Exposes admin / write tools (`save_to_scope`, `add_to_allowlist`,
 `approve_user`, `record_pending_user`, `list_pending_users`). Each tool
-takes the verified sender's WhatsApp lid as a `sender_lid` argument; the
+takes the verified sender's WhatsApp wa_id as a `sender_id` argument; the
 proxy looks the role up from scopes.yaml and picks the right per-role
 OAuth bearer from a static bearers file before forwarding the call to
 gbrain.
 
-v0.2 (2026-06-18): per-call sender_lid arg instead of per-session env var.
+v0.2 (2026-06-18): per-call sender_id arg instead of per-session env var.
 Required because the new azure-foundry provider doesn't have the
 per-session --mcp-config injection path the previous claude-code-cli
 provider used to pass HERMES_SENDER_LID at startup. With the new design
@@ -29,7 +29,7 @@ Env vars (read once at startup; no per-session env):
   HERMES_PENDING_USERS_PATH — optional, defaults to the pilot path
 
 Audit: every tool call writes one structured line to stderr so the parent
-shell (hermes.service journal) captures it. The `sender_lid` from the
+shell (hermes.service journal) captures it. The `sender_id` from the
 tool args is included in every audit record.
 """
 
@@ -61,10 +61,10 @@ _SERVER_VERSION = "0.2.0"
 # the server fails closed — no role lookup, no bearer routing, no audit.
 _SENDER_LID_SCHEMA: Dict[str, Any] = {
     "type": "string",
-    "pattern": r"^\d{6,}@lid$",
+    "pattern": r"^\d{8,15}$",
     "description": (
-        "REQUIRED. The verified sender's WhatsApp lid (format "
-        "`<digits>@lid`), copied verbatim from the most recent "
+        "REQUIRED. The verified sender's WhatsApp wa_id (format "
+        "`<wa_id digits>`), copied verbatim from the most recent "
         "<verified_sender id=\"...\"/> marker on the user's "
         "message. The server resolves the sender's role from "
         "scopes.yaml using this lid and picks the right per-role "
@@ -115,13 +115,13 @@ def _load_bearers(path: str) -> Dict[str, str]:
         return {}
 
 
-def _resolve_role(scopes_data: Dict[str, Any], sender_lid: str) -> Optional[str]:
+def _resolve_role(scopes_data: Dict[str, Any], sender_id: str) -> Optional[str]:
     """Look up sender role: super_admin if in super_admins list, else from users list."""
     for entry in scopes_data.get("super_admins") or []:
-        if str(entry.get("id", "")).strip() == sender_lid:
+        if str(entry.get("id", "")).strip() == sender_id:
             return "super_admin"
     for entry in scopes_data.get("users") or []:
-        if str(entry.get("id", "")).strip() == sender_lid:
+        if str(entry.get("id", "")).strip() == sender_id:
             return str(entry.get("role", "")).strip() or None
     return None
 
@@ -236,7 +236,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sender_lid": _SENDER_LID_SCHEMA,
+                        "sender_id": _SENDER_LID_SCHEMA,
                         "scope": {
                             "type": "string",
                             "enum": available_scopes,
@@ -262,7 +262,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                             ),
                         },
                     },
-                    "required": ["sender_lid", "scope", "title", "body"],
+                    "required": ["sender_id", "scope", "title", "body"],
                 },
             },
             {
@@ -283,12 +283,12 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sender_lid": _SENDER_LID_SCHEMA,
-                        "target_lid": {
+                        "sender_id": _SENDER_LID_SCHEMA,
+                        "target_id": {
                             "type": "string",
                             "description": (
-                                "The new user's WhatsApp lid (the same "
-                                "`<digits>@lid` string from the verified-"
+                                "The new user's WhatsApp wa_id (the same "
+                                "`<wa_id digits>` string from the verified-"
                                 "sender marker on their message)."
                             ),
                         },
@@ -301,7 +301,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                             ),
                         },
                     },
-                    "required": ["sender_lid", "target_lid"],
+                    "required": ["sender_id", "target_id"],
                 },
             },
             {
@@ -318,8 +318,8 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 ),
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"sender_lid": _SENDER_LID_SCHEMA},
-                    "required": ["sender_lid"],
+                    "properties": {"sender_id": _SENDER_LID_SCHEMA},
+                    "required": ["sender_id"],
                 },
             },
             {
@@ -340,7 +340,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sender_lid": _SENDER_LID_SCHEMA,
+                        "sender_id": _SENDER_LID_SCHEMA,
                         "phone": {
                             "type": "string",
                             "description": (
@@ -358,7 +358,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                             ),
                         },
                     },
-                    "required": ["sender_lid", "phone"],
+                    "required": ["sender_id", "phone"],
                 },
             },
             {
@@ -377,17 +377,16 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sender_lid": _SENDER_LID_SCHEMA,
-                        "target_lid": {
+                        "sender_id": _SENDER_LID_SCHEMA,
+                        "target_id": {
                             "type": "string",
                             "description": (
-                                "WhatsApp lid of the user to approve, "
-                                "format `<digits>@lid` (e.g., "
-                                "`87449845936164@lid`). The lid is the "
-                                "privacy-mode identifier — NOT the phone "
-                                "number. Capture it from the verified-sender "
+                                "WhatsApp wa_id of the user to approve "
+                                "(bare digits, e.g., `923333717117`). "
+                                "Captured verbatim from the verified-sender "
                                 "marker on a message the new user has "
-                                "already sent."
+                                "already sent — Meta's Cloud API delivers "
+                                "the real E.164 number minus the `+` prefix."
                             ),
                         },
                         "name": {
@@ -433,7 +432,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                             ),
                         },
                     },
-                    "required": ["sender_lid", "target_lid", "name", "role"],
+                    "required": ["sender_id", "target_id", "name", "role"],
                 },
             },
             {
@@ -447,8 +446,8 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 ),
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"sender_lid": _SENDER_LID_SCHEMA},
-                    "required": ["sender_lid"],
+                    "properties": {"sender_id": _SENDER_LID_SCHEMA},
+                    "required": ["sender_id"],
                 },
             },
             {
@@ -463,7 +462,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sender_lid": _SENDER_LID_SCHEMA,
+                        "sender_id": _SENDER_LID_SCHEMA,
                         "phone": {
                             "type": "string",
                             "description": (
@@ -472,7 +471,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                             ),
                         },
                     },
-                    "required": ["sender_lid", "phone"],
+                    "required": ["sender_id", "phone"],
                 },
             },
             {
@@ -487,11 +486,11 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sender_lid": _SENDER_LID_SCHEMA,
-                        "target_lid": {
+                        "sender_id": _SENDER_LID_SCHEMA,
+                        "target_id": {
                             "type": "string",
                             "description": (
-                                "The lid to remove, format `<digits>@lid`."
+                                "The lid to remove, format `<wa_id digits>`."
                             ),
                         },
                         "confirm_super_admin": {
@@ -503,7 +502,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                             ),
                         },
                     },
-                    "required": ["sender_lid", "target_lid"],
+                    "required": ["sender_id", "target_id"],
                 },
             },
             {
@@ -518,10 +517,10 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sender_lid": _SENDER_LID_SCHEMA,
-                        "target_lid": {
+                        "sender_id": _SENDER_LID_SCHEMA,
+                        "target_id": {
                             "type": "string",
-                            "description": "The user receiving the grant (`<digits>@lid`).",
+                            "description": "The user receiving the grant (`<wa_id digits>`).",
                         },
                         "scope": {
                             "type": "string",
@@ -532,7 +531,7 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                             ),
                         },
                     },
-                    "required": ["sender_lid", "target_lid", "scope"],
+                    "required": ["sender_id", "target_id", "scope"],
                 },
             },
             {
@@ -548,17 +547,17 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sender_lid": _SENDER_LID_SCHEMA,
-                        "target_lid": {
+                        "sender_id": _SENDER_LID_SCHEMA,
+                        "target_id": {
                             "type": "string",
-                            "description": "The user losing the grant (`<digits>@lid`).",
+                            "description": "The user losing the grant (`<wa_id digits>`).",
                         },
                         "scope": {
                             "type": "string",
                             "description": "The scope id to revoke (must be in target's extra_reads).",
                         },
                     },
-                    "required": ["sender_lid", "target_lid", "scope"],
+                    "required": ["sender_id", "target_id", "scope"],
                 },
             },
             {
@@ -574,15 +573,15 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 ),
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"sender_lid": _SENDER_LID_SCHEMA},
-                    "required": ["sender_lid"],
+                    "properties": {"sender_id": _SENDER_LID_SCHEMA},
+                    "required": ["sender_id"],
                 },
             },
         ]
     }
 
 
-_LID_RE = re.compile(r"^\d{6,}@lid$")
+_SENDER_ID_RE = re.compile(r"^\d{8,15}$")
 _PHONE_RE = re.compile(r"^\d{9,15}$")  # international digits-only, no '+'
 
 # Pending-users queue path. Default lives under the hermes-user home so the
@@ -696,14 +695,14 @@ def _existing_lids(scopes_data: Dict[str, Any]) -> set[str]:
     return seen
 
 
-def _is_super_admin(scopes_data: Dict[str, Any], sender_lid: str) -> bool:
+def _is_super_admin(scopes_data: Dict[str, Any], sender_id: str) -> bool:
     for e in scopes_data.get("super_admins") or []:
-        if str(e.get("id", "")).strip() == sender_lid:
+        if str(e.get("id", "")).strip() == sender_id:
             return True
     return False
 
 
-def _append_user_to_scopes_yaml(path: str, target_lid: str, name: str, role: str, platform: str) -> None:
+def _append_user_to_scopes_yaml(path: str, target_id: str, name: str, role: str, platform: str) -> None:
     """Append a new user line to the END of scopes.yaml.
 
     The `users:` section in scopes.yaml is intentionally kept last so any
@@ -717,7 +716,7 @@ def _append_user_to_scopes_yaml(path: str, target_lid: str, name: str, role: str
     itself: `# /approve by <sender> at <UTC>`.
     """
     safe_name = name.replace('"', "'")
-    line = f'  - {{ id: "{target_lid}", name: "{safe_name}", role: {role}, platform: {platform} }}\n'
+    line = f'  - {{ id: "{target_id}", name: "{safe_name}", role: {role}, platform: {platform} }}\n'
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     audit = f"  # added via /approve at {ts}\n"
 
@@ -730,14 +729,14 @@ def _append_user_to_scopes_yaml(path: str, target_lid: str, name: str, role: str
     _atomic_write(path, new_text)
 
 
-def _append_super_admin_to_scopes_yaml(path: str, target_lid: str, name: str, sender_lid: str) -> None:
+def _append_super_admin_to_scopes_yaml(path: str, target_id: str, name: str, sender_id: str) -> None:
     """Insert an entry into the `super_admins:` block (right after the header —
     list order is irrelevant). Super_admins carry NO `role:` field. TEXT edit
     preserves comments; the audit comment records who granted it and when."""
     safe_name = name.replace('"', "'")
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    audit = f"  # SUPER_ADMIN_GRANT via /approve by {sender_lid} at {ts}"
-    entry = f'  - {{ id: "{target_lid}", name: "{safe_name}", platform: whatsapp }}'
+    audit = f"  # SUPER_ADMIN_GRANT via /approve by {sender_id} at {ts}"
+    entry = f'  - {{ id: "{target_id}", name: "{safe_name}", platform: whatsapp }}'
     with open(path, "r", encoding="utf-8") as fh:
         lines = fh.read().splitlines()
     out: List[str] = []
@@ -753,7 +752,7 @@ def _append_super_admin_to_scopes_yaml(path: str, target_lid: str, name: str, se
     _atomic_write(path, "\n".join(out) + "\n")
 
 
-def _remove_super_admin_from_scopes_yaml(path: str, target_lid: str) -> bool:
+def _remove_super_admin_from_scopes_yaml(path: str, target_id: str) -> bool:
     """Remove a `super_admins:` entry by lid (a `- {` line with the id and NO
     `role:` field — that's what distinguishes super_admins from users). Drops a
     preceding SUPER_ADMIN_GRANT audit comment too. Returns True if removed."""
@@ -762,7 +761,7 @@ def _remove_super_admin_from_scopes_yaml(path: str, target_lid: str) -> bool:
     out: List[str] = []
     removed = False
     for ln in text.splitlines():
-        if (f'id: "{target_lid}"' in ln and "- {" in ln and "role:" not in ln):
+        if (f'id: "{target_id}"' in ln and "- {" in ln and "role:" not in ln):
             removed = True
             if out and out[-1].strip().startswith("# SUPER_ADMIN_GRANT"):
                 out.pop()
@@ -843,8 +842,8 @@ def _remove_phone_from_allowlist(env_path: str, phone: str) -> bool:
     return True
 
 
-def _remove_user_from_scopes_yaml(path: str, target_lid: str) -> bool:
-    """Remove the `users:` entry whose id == target_lid (TEXT edit; preserves
+def _remove_user_from_scopes_yaml(path: str, target_id: str) -> bool:
+    """Remove the `users:` entry whose id == target_id (TEXT edit; preserves
     comments). Drops a preceding `# added via /approve` audit line too. Only
     matches lines that carry a `role:` field, so super_admins entries (which
     have none) are never removed from chat. Returns True if removed."""
@@ -853,7 +852,7 @@ def _remove_user_from_scopes_yaml(path: str, target_lid: str) -> bool:
     out: List[str] = []
     removed = False
     for ln in text.splitlines():
-        if (f'id: "{target_lid}"' in ln and "role:" in ln and "- {" in ln):
+        if (f'id: "{target_id}"' in ln and "role:" in ln and "- {" in ln):
             removed = True
             if out and out[-1].strip().startswith("# added via /approve"):
                 out.pop()
@@ -866,7 +865,7 @@ def _remove_user_from_scopes_yaml(path: str, target_lid: str) -> bool:
 
 
 def _phone_to_lid(session_dir: str, phone: str) -> Optional[str]:
-    """Resolve a phone → its WhatsApp lid via the bridge's reverse-mapping
+    """Resolve a phone → its WhatsApp wa_id via the bridge's reverse-mapping
     files (`lid-mapping-<lid>_reverse.json` contains the phone). The lid is in
     the filename. Returns `<digits>` or None."""
     try:
@@ -932,8 +931,8 @@ def _restart_gateway_detached() -> bool:
 # above + alongside user entries are preserved across the edit — the
 # text-edit pattern the other helpers use can't safely insert into the
 # middle of an inline-mapping line like `- { id: ..., name: ..., role: ... }`.
-def _scopes_yaml_grant_extra_read(path: str, target_lid: str, scope_id: str) -> str:
-    """Add `scope_id` to target_lid's extra_reads in scopes.yaml.
+def _scopes_yaml_grant_extra_read(path: str, target_id: str, scope_id: str) -> str:
+    """Add `scope_id` to target_id's extra_reads in scopes.yaml.
 
     Returns:
         'added'      — scope appended to extra_reads (or extra_reads created)
@@ -954,13 +953,13 @@ def _scopes_yaml_grant_extra_read(path: str, target_lid: str, scope_id: str) -> 
         return "unknown_scope"
     # super_admin entries
     for entry in (data.get("super_admins") or []):
-        if str(entry.get("id", "")).strip() == target_lid:
+        if str(entry.get("id", "")).strip() == target_id:
             return "super_admin"
     # user entries
     users = data.get("users") or []
     target_entry = None
     for entry in users:
-        if str(entry.get("id", "")).strip() == target_lid:
+        if str(entry.get("id", "")).strip() == target_id:
             target_entry = entry
             break
     if target_entry is None:
@@ -984,8 +983,8 @@ def _scopes_yaml_grant_extra_read(path: str, target_lid: str, scope_id: str) -> 
     return "added"
 
 
-def _scopes_yaml_revoke_extra_read(path: str, target_lid: str, scope_id: str) -> str:
-    """Remove `scope_id` from target_lid's extra_reads.
+def _scopes_yaml_revoke_extra_read(path: str, target_id: str, scope_id: str) -> str:
+    """Remove `scope_id` from target_id's extra_reads.
 
     Returns:
         'removed'     — scope dropped from extra_reads
@@ -1007,12 +1006,12 @@ def _scopes_yaml_revoke_extra_read(path: str, target_lid: str, scope_id: str) ->
     if scope_id not in scopes_map:
         return "unknown_scope"
     for entry in (data.get("super_admins") or []):
-        if str(entry.get("id", "")).strip() == target_lid:
+        if str(entry.get("id", "")).strip() == target_id:
             return "super_admin"
     users = data.get("users") or []
     target_entry = None
     for entry in users:
-        if str(entry.get("id", "")).strip() == target_lid:
+        if str(entry.get("id", "")).strip() == target_id:
             target_entry = entry
             break
     if target_entry is None:
@@ -1077,13 +1076,13 @@ def _sync_subjects_to_gbrain(scopes_yaml_path: str) -> Optional[str]:
     return None
 
 
-def _remove_subject_from_gbrain(target_lid: str) -> Optional[str]:
-    """Soft-delete the subject row for `target_lid` in gbrain.
+def _remove_subject_from_gbrain(target_id: str) -> Optional[str]:
+    """Soft-delete the subject row for `target_id` in gbrain.
     Returns None on success or an error string. NEVER raises."""
     import subprocess
     try:
         proc = subprocess.run(
-            ["gbrain", "auth", "subjects", "remove", target_lid],
+            ["gbrain", "auth", "subjects", "remove", target_id],
             capture_output=True, text=True, timeout=15,
             env={**os.environ, "PATH": "/home/hermes-user/.bun/bin:" + os.environ.get("PATH", "")},
         )
@@ -1107,28 +1106,28 @@ def _handle_record_pending_user(
 ) -> Dict[str, Any]:
     """Append the new user's lid to the pending queue. No super_admin
     gate — the bot calls this for every None-tier turn."""
-    target_lid = str(args.get("target_lid") or "").strip()
+    target_id = str(args.get("target_id") or "").strip()
     snippet = str(args.get("first_message_snippet") or "").strip()[:200]
 
-    if not target_lid:
-        return {"isError": True, "content": [{"type": "text", "text": "target_lid is required."}]}
-    if not _LID_RE.match(target_lid):
+    if not target_id:
+        return {"isError": True, "content": [{"type": "text", "text": "target_id is required."}]}
+    if not _SENDER_ID_RE.match(target_id):
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
-                f"target_lid format invalid: '{target_lid}'. Expected "
-                f"`<digits>@lid`."
+                f"target_sender_id format invalid: '{target_id}'. Expected "
+                f"`<wa_id digits>`."
             )}],
         }
 
     entries = _load_pending(pending_path)
     # Idempotent — don't duplicate.
-    if any(e.get("lid") == target_lid for e in entries):
+    if any(e.get("lid") == target_id for e in entries):
         return {"content": [{"type": "text", "text": (
-            f"📋 Pending user {target_lid} already queued (no duplicate)."
+            f"📋 Pending user {target_id} already queued (no duplicate)."
         )}]}
     entry = {
-        "lid": target_lid,
+        "lid": target_id,
         "first_seen_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "snippet": snippet,
     }
@@ -1136,7 +1135,7 @@ def _handle_record_pending_user(
     try:
         _write_pending(pending_path, entries)
     except Exception as exc:
-        _log("error", "record_pending_user write failed", lid=target_lid, error=str(exc))
+        _log("error", "record_pending_user write failed", lid=target_id, error=str(exc))
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
@@ -1145,15 +1144,15 @@ def _handle_record_pending_user(
                 f"the queue. Check file permissions."
             )}],
         }
-    _log("info", "pending user recorded", lid=target_lid, snippet=snippet)
+    _log("info", "pending user recorded", lid=target_id, snippet=snippet)
     return {"content": [{"type": "text", "text": (
-        f"Recorded pending user {target_lid}. {len(entries)} total in queue."
+        f"Recorded pending user {target_id}. {len(entries)} total in queue."
     )}]}
 
 
 def _handle_list_pending_users(
     scopes_data: Dict[str, Any],
-    sender_lid: str,
+    sender_id: str,
     pending_path: str,
     env_path: str,
     session_dir: str,
@@ -1162,8 +1161,8 @@ def _handle_list_pending_users(
     scopes.yaml (computed, lid-resolved). The computed half is the robust fix:
     it surfaces a user even if the agent never called record_pending_user.
     Super_admin only."""
-    if not _is_super_admin(scopes_data, sender_lid):
-        _log("warn", "list_pending_users denied", sender=sender_lid)
+    if not _is_super_admin(scopes_data, sender_id):
+        _log("warn", "list_pending_users denied", sender=sender_id)
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
@@ -1224,18 +1223,18 @@ def _handle_list_pending_users(
     return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
 
-def _remove_from_pending(pending_path: str, target_lid: str) -> bool:
+def _remove_from_pending(pending_path: str, target_id: str) -> bool:
     """Drop the matching lid from the queue. Returns True if anything
     was removed. Used by approve_user to clean up on success."""
     entries = _load_pending(pending_path)
     before = len(entries)
-    entries = [e for e in entries if e.get("lid") != target_lid]
+    entries = [e for e in entries if e.get("lid") != target_id]
     if len(entries) == before:
         return False
     try:
         _write_pending(pending_path, entries)
     except Exception as exc:
-        _log("warn", "remove_from_pending write failed", lid=target_lid, error=str(exc))
+        _log("warn", "remove_from_pending write failed", lid=target_id, error=str(exc))
         return False
     return True
 
@@ -1243,15 +1242,15 @@ def _remove_from_pending(pending_path: str, target_lid: str) -> bool:
 def _handle_add_to_allowlist(
     args: Dict[str, Any],
     scopes_data: Dict[str, Any],
-    sender_lid: str,
+    sender_id: str,
     env_path: str,
 ) -> Dict[str, Any]:
     """Add a phone to WHATSAPP_ALLOWED_USERS. Super_admin only."""
     phone = str(args.get("phone") or "").strip().lstrip("+").replace(" ", "")
     memo = str(args.get("memo") or "").strip() or None
 
-    if not _is_super_admin(scopes_data, sender_lid):
-        _log("warn", "add_to_allowlist denied", sender=sender_lid, phone=phone)
+    if not _is_super_admin(scopes_data, sender_id):
+        _log("warn", "add_to_allowlist denied", sender=sender_id, phone=phone)
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
@@ -1282,7 +1281,7 @@ def _handle_add_to_allowlist(
     try:
         changed = _append_phone_to_allowlist(env_path, phone, memo)
     except Exception as exc:
-        _log("error", "add_to_allowlist write failed", sender=sender_lid, phone=phone, error=str(exc))
+        _log("error", "add_to_allowlist write failed", sender=sender_id, phone=phone, error=str(exc))
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
@@ -1295,7 +1294,7 @@ def _handle_add_to_allowlist(
             f"📋 Phone {phone} was already on the allowlist — no change."
         )}]}
 
-    _log("info", "add_to_allowlist success", sender=sender_lid, phone=phone, memo=memo)
+    _log("info", "add_to_allowlist success", sender=sender_id, phone=phone, memo=memo)
     return {"content": [{"type": "text", "text": (
         f"✅ Phone added to gateway allowlist.\n\n"
         f"- phone: {phone}\n"
@@ -1314,19 +1313,19 @@ def _handle_add_to_allowlist(
 def _handle_approve_user(
     args: Dict[str, Any],
     scopes_data: Dict[str, Any],
-    sender_lid: str,
+    sender_id: str,
     role: Optional[str],
     scopes_yaml_path: str,
     session_dir: str,
 ) -> Dict[str, Any]:
-    target_lid = str(args.get("target_lid") or "").strip()
+    target_id = str(args.get("target_id") or "").strip()
     name = str(args.get("name") or "").strip()
     requested_role = str(args.get("role") or "").strip()
     platform = str(args.get("platform") or "whatsapp").strip().lower() or "whatsapp"
 
     # ── Authorization: only super_admins may onboard ───────────────────────
-    if not _is_super_admin(scopes_data, sender_lid):
-        _log("warn", "approve_user denied (not super_admin)", sender=sender_lid, target=target_lid)
+    if not _is_super_admin(scopes_data, sender_id):
+        _log("warn", "approve_user denied (not super_admin)", sender=sender_id, target=target_id)
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
@@ -1339,20 +1338,20 @@ def _handle_approve_user(
         }
 
     # ── Validate inputs ────────────────────────────────────────────────────
-    if not target_lid or not name or not requested_role:
+    if not target_id or not name or not requested_role:
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
-                "approve_user requires target_lid, name, and role."
+                "approve_user requires target_id, name, and role."
             )}],
         }
 
-    if not _LID_RE.match(target_lid):
+    if not _SENDER_ID_RE.match(target_id):
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
-                f"target_lid format invalid: '{target_lid}'. Expected "
-                f"`<digits>@lid` (the WhatsApp privacy-mode identifier). "
+                f"target_sender_id format invalid: '{target_id}'. Expected "
+                f"`<wa_id digits>` (the WhatsApp privacy-mode identifier). "
                 f"Capture the lid from the verified-sender marker on a "
                 f"message the new user already sent."
             )}],
@@ -1369,32 +1368,32 @@ def _handle_approve_user(
                 "every scope, runs on/off-boarding, and can mint other "
                 "super_admins. Re-issue with confirm_super_admin=true to proceed."
             )}]}
-        if not _lid_is_known(session_dir, target_lid):
+        if not _lid_is_known(session_dir, target_id):
             return {"isError": True, "content": [{"type": "text", "text": (
-                f"Won't grant super_admin to {target_lid}: WhatsApp hasn't "
+                f"Won't grant super_admin to {target_id}: WhatsApp hasn't "
                 f"resolved this lid (no mapping on file), so it may be a typo "
                 f"or guess. Have them send one message first so the lid is "
                 f"verified, then retry."
             )}]}
-        if _is_super_admin(scopes_data, target_lid):
+        if _is_super_admin(scopes_data, target_id):
             return {"content": [{"type": "text", "text": (
-                f"{target_lid} is already a super_admin — no change."
+                f"{target_id} is already a super_admin — no change."
             )}]}
         try:
-            _append_super_admin_to_scopes_yaml(scopes_yaml_path, target_lid, name, sender_lid)
+            _append_super_admin_to_scopes_yaml(scopes_yaml_path, target_id, name, sender_id)
         except Exception as exc:
-            _log("error", "super_admin grant write failed", sender=sender_lid, target=target_lid, error=str(exc))
+            _log("error", "super_admin grant write failed", sender=sender_id, target=target_id, error=str(exc))
             return {"isError": True, "content": [{"type": "text", "text": (
                 f"Failed to write scopes.yaml: {exc}. NOT granted."
             )}]}
         pending_path = os.environ.get("HERMES_PENDING_USERS_PATH") or _DEFAULT_PENDING_PATH
-        _remove_from_pending(pending_path, target_lid)
-        _log("warn", "SUPER_ADMIN_GRANT", sender=sender_lid, target_lid=target_lid, name=name)
+        _remove_from_pending(pending_path, target_id)
+        _log("warn", "SUPER_ADMIN_GRANT", sender=sender_id, target_id=target_id, name=name)
         _sync_err = _sync_subjects_to_gbrain(scopes_yaml_path)
         _sync_note = f"\n\n⚠️ Subjects sync warning: {_sync_err}" if _sync_err else ""
         return {"content": [{"type": "text", "text": (
             f"✅ SUPER_ADMIN granted.{_sync_note}\n\n"
-            f"- lid: `{target_lid}`\n- name: {name}\n- role: super_admin\n\n"
+            f"- lid: `{target_id}`\n- name: {name}\n- role: super_admin\n\n"
             f"Effective on their next message (scopes.yaml mtime reload, no "
             f"restart). Logged as SUPER_ADMIN_GRANT.\n\n"
             f"Reminder: `scp /opt/hermes/workspace/scopes.yaml ./azure/config/` "
@@ -1423,11 +1422,11 @@ def _handle_approve_user(
 
     # ── Idempotency: don't double-add ──────────────────────────────────────
     existing = _existing_lids(scopes_data)
-    if target_lid in existing:
+    if target_id in existing:
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
-                f"User {target_lid} is already in scopes.yaml. To change "
+                f"User {target_id} is already in scopes.yaml. To change "
                 f"their role, SSH in and edit scopes.yaml — chat-driven "
                 f"role changes are intentionally not supported in v0.1 "
                 f"(avoid privilege-escalation paths through chat-only ops)."
@@ -1436,9 +1435,9 @@ def _handle_approve_user(
 
     # ── Write ──────────────────────────────────────────────────────────────
     try:
-        _append_user_to_scopes_yaml(scopes_yaml_path, target_lid, name, requested_role, platform)
+        _append_user_to_scopes_yaml(scopes_yaml_path, target_id, name, requested_role, platform)
     except Exception as exc:
-        _log("error", "approve_user write failed", sender=sender_lid, target=target_lid, error=str(exc))
+        _log("error", "approve_user write failed", sender=sender_id, target=target_id, error=str(exc))
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
@@ -1449,15 +1448,15 @@ def _handle_approve_user(
 
     # Drop from the pending-users queue (no-op if they weren't queued).
     pending_path = os.environ.get("HERMES_PENDING_USERS_PATH") or _DEFAULT_PENDING_PATH
-    _remove_from_pending(pending_path, target_lid)
+    _remove_from_pending(pending_path, target_id)
 
     _sync_err = _sync_subjects_to_gbrain(scopes_yaml_path)
     _sync_note = f"\n\n⚠️ Subjects sync warning: {_sync_err}" if _sync_err else ""
     _log(
         "info",
         "approve_user success",
-        sender=sender_lid,
-        target_lid=target_lid,
+        sender=sender_id,
+        target_id=target_id,
         name=name,
         role=requested_role,
         platform=platform,
@@ -1465,7 +1464,7 @@ def _handle_approve_user(
     return {
         "content": [{"type": "text", "text": (
             f"✅ User onboarded.\n\n"
-            f"- lid: `{target_lid}`\n"
+            f"- lid: `{target_id}`\n"
             f"- name: {name}\n"
             f"- role: {requested_role}\n"
             f"- platform: {platform}{_sync_note}\n\n"
@@ -1481,12 +1480,12 @@ def _handle_approve_user(
 
 def _handle_list_allowlist(
     scopes_data: Dict[str, Any],
-    sender_lid: str,
+    sender_id: str,
     env_path: str,
     session_dir: str,
 ) -> Dict[str, Any]:
     """Show the gateway allowlist with memo + onboarding status. Super_admin only."""
-    if not _is_super_admin(scopes_data, sender_lid):
+    if not _is_super_admin(scopes_data, sender_id):
         return {"isError": True, "content": [{"type": "text", "text": (
             "The allowlist is restricted to super_admins."
         )}]}
@@ -1518,12 +1517,12 @@ def _handle_list_allowlist(
 def _handle_remove_from_allowlist(
     args: Dict[str, Any],
     scopes_data: Dict[str, Any],
-    sender_lid: str,
+    sender_id: str,
     env_path: str,
 ) -> Dict[str, Any]:
     """Remove a phone from the allowlist. Super_admin only. Needs reload_gateway."""
     phone = str(args.get("phone") or "").strip().lstrip("+").replace(" ", "")
-    if not _is_super_admin(scopes_data, sender_lid):
+    if not _is_super_admin(scopes_data, sender_id):
         return {"isError": True, "content": [{"type": "text", "text": (
             "The allowlist is restricted to super_admins."
         )}]}
@@ -1536,7 +1535,7 @@ def _handle_remove_from_allowlist(
     try:
         removed = _remove_phone_from_allowlist(env_path, phone)
     except Exception as exc:
-        _log("error", "remove_from_allowlist failed", sender=sender_lid, phone=phone, error=str(exc))
+        _log("error", "remove_from_allowlist failed", sender=sender_id, phone=phone, error=str(exc))
         return {"isError": True, "content": [{"type": "text", "text": (
             "Failed to edit .env: %s. Check file permissions." % exc
         )}]}
@@ -1544,7 +1543,7 @@ def _handle_remove_from_allowlist(
         return {"content": [{"type": "text", "text": (
             "📋 %s was not on the allowlist — nothing to remove." % phone
         )}]}
-    _log("info", "remove_from_allowlist success", sender=sender_lid, phone=phone)
+    _log("info", "remove_from_allowlist success", sender=sender_id, phone=phone)
     return {"content": [{"type": "text", "text": (
         "✅ Removed %s from the allowlist.\n\n"
         "⚠️ The gateway only reads the allowlist at startup, so this isn't "
@@ -1557,58 +1556,58 @@ def _handle_remove_from_allowlist(
 def _handle_revoke_user(
     args: Dict[str, Any],
     scopes_data: Dict[str, Any],
-    sender_lid: str,
+    sender_id: str,
     scopes_yaml_path: str,
     pending_path: str,
 ) -> Dict[str, Any]:
     """Remove a non-super_admin user from scopes.yaml. Super_admin only."""
-    target_lid = str(args.get("target_lid") or "").strip()
-    if not _is_super_admin(scopes_data, sender_lid):
+    target_id = str(args.get("target_id") or "").strip()
+    if not _is_super_admin(scopes_data, sender_id):
         return {"isError": True, "content": [{"type": "text", "text": (
             "Off-boarding is restricted to super_admins."
         )}]}
-    if not _LID_RE.match(target_lid):
+    if not _SENDER_ID_RE.match(target_id):
         return {"isError": True, "content": [{"type": "text", "text": (
-            "target_lid format invalid: '%s'. Expected `<digits>@lid`." % target_lid
+            "target_sender_id format invalid: '%s'. Expected `<wa_id digits>`." % target_id
         )}]}
-    target_is_sa = _is_super_admin(scopes_data, target_lid)
+    target_is_sa = _is_super_admin(scopes_data, target_id)
     if target_is_sa:
         # Guarded super_admin removal (decision 2026-06-18).
         if not bool(args.get("confirm_super_admin")):
             return {"isError": True, "content": [{"type": "text", "text": (
                 "%s is a super_admin. Removing a super_admin is high-privilege "
-                "— re-issue with confirm_super_admin=true to proceed." % target_lid
+                "— re-issue with confirm_super_admin=true to proceed." % target_id
             )}]}
         if _count_super_admins(scopes_data) <= 1:
             return {"isError": True, "content": [{"type": "text", "text": (
                 "Refusing: %s is the LAST super_admin — removing it would lock "
-                "everyone out of admin ops. Add another super_admin first." % target_lid
+                "everyone out of admin ops. Add another super_admin first." % target_id
             )}]}
     try:
         if target_is_sa:
-            removed = _remove_super_admin_from_scopes_yaml(scopes_yaml_path, target_lid)
+            removed = _remove_super_admin_from_scopes_yaml(scopes_yaml_path, target_id)
         else:
-            removed = _remove_user_from_scopes_yaml(scopes_yaml_path, target_lid)
+            removed = _remove_user_from_scopes_yaml(scopes_yaml_path, target_id)
     except Exception as exc:
-        _log("error", "revoke_user failed", sender=sender_lid, target=target_lid, error=str(exc))
+        _log("error", "revoke_user failed", sender=sender_id, target=target_id, error=str(exc))
         return {"isError": True, "content": [{"type": "text", "text": (
             "Failed to edit scopes.yaml: %s. User NOT removed." % exc
         )}]}
     if not removed:
         return {"content": [{"type": "text", "text": (
-            "📋 %s wasn't found in scopes.yaml — nothing to revoke." % target_lid
+            "📋 %s wasn't found in scopes.yaml — nothing to revoke." % target_id
         )}]}
-    _remove_from_pending(pending_path, target_lid)
+    _remove_from_pending(pending_path, target_id)
     # Soft-delete the gbrain subject row so future token-exchange for this
     # lid returns invalid_grant (subject no longer resolvable). Existing
     # tokens already minted become invalid at next verify (gbrain joins
     # subjects with deleted_at IS NULL — see verifyAccessToken).
-    _subject_err = _remove_subject_from_gbrain(target_lid)
+    _subject_err = _remove_subject_from_gbrain(target_id)
     _subject_note = f"\n\n⚠️ Subject soft-delete warning: {_subject_err}" if _subject_err else ""
     _log(
         "warn" if target_is_sa else "info",
         "SUPER_ADMIN_REVOKE" if target_is_sa else "revoke_user success",
-        sender=sender_lid, target=target_lid,
+        sender=sender_id, target=target_id,
     )
     kind = "SUPER_ADMIN" if target_is_sa else "user"
     return {"content": [{"type": "text", "text": (
@@ -1618,7 +1617,7 @@ def _handle_revoke_user(
         "`scp /opt/hermes/workspace/scopes.yaml ./azure/config/` before the "
         "next deploy. (Their allowlist entry, if any, is separate — use "
         "`remove_from_allowlist` to drop that too.)" % (
-            kind, target_lid, _subject_note,
+            kind, target_id, _subject_note,
             " Logged as SUPER_ADMIN_REVOKE." if target_is_sa else "",
         )
     )}]}
@@ -1628,7 +1627,7 @@ def _handle_revoke_user(
 def _handle_grant_scope_access(
     args: Dict[str, Any],
     scopes_data: Dict[str, Any],
-    sender_lid: str,
+    sender_id: str,
     scopes_yaml_path: str,
 ) -> Dict[str, Any]:
     """Grant a user read access to one additional scope. Super_admin only.
@@ -1639,26 +1638,26 @@ def _handle_grant_scope_access(
     token-exchange call. Role baseline reads are unchanged — this only
     edits the per-user override list.
     """
-    target_lid = str(args.get("target_lid") or "").strip()
+    target_id = str(args.get("target_id") or "").strip()
     scope_id = str(args.get("scope") or "").strip()
-    if not _is_super_admin(scopes_data, sender_lid):
+    if not _is_super_admin(scopes_data, sender_id):
         return {"isError": True, "content": [{"type": "text", "text": (
             "Scope grants are restricted to super_admins. Your sender "
             "identity does not have super_admin privileges."
         )}]}
-    if not _LID_RE.match(target_lid):
+    if not _SENDER_ID_RE.match(target_id):
         return {"isError": True, "content": [{"type": "text", "text": (
-            f"target_lid format invalid: '{target_lid}'. Expected `<digits>@lid`."
+            f"target_sender_id format invalid: '{target_id}'. Expected `<wa_id digits>`."
         )}]}
     if not scope_id:
         return {"isError": True, "content": [{"type": "text", "text": (
             "scope is required (e.g. 'leadership', 'finance', 'project_mesec')."
         )}]}
     try:
-        result = _scopes_yaml_grant_extra_read(scopes_yaml_path, target_lid, scope_id)
+        result = _scopes_yaml_grant_extra_read(scopes_yaml_path, target_id, scope_id)
     except Exception as exc:
         _log("error", "grant_scope_access write failed",
-             sender=sender_lid, target=target_lid, scope=scope_id, error=str(exc))
+             sender=sender_id, target=target_id, scope=scope_id, error=str(exc))
         return {"isError": True, "content": [{"type": "text", "text": (
             f"Failed to edit scopes.yaml: {exc}. No grant applied."
         )}]}
@@ -1671,35 +1670,35 @@ def _handle_grant_scope_access(
         )}]}
     if result == "not_found":
         return {"isError": True, "content": [{"type": "text", "text": (
-            f"User {target_lid} is not in scopes.yaml. Onboard them first "
+            f"User {target_id} is not in scopes.yaml. Onboard them first "
             f"via approve_user, then re-issue the grant."
         )}]}
     if result == "super_admin":
         return {"content": [{"type": "text", "text": (
-            f"{target_lid} is a super_admin and already has access to every scope. "
+            f"{target_id} is a super_admin and already has access to every scope. "
             f"No grant needed."
         )}]}
     if result == "role_baseline":
         role = ""
         for e in (scopes_data.get("users") or []):
-            if str(e.get("id", "")).strip() == target_lid:
+            if str(e.get("id", "")).strip() == target_id:
                 role = str(e.get("role", "")).strip()
                 break
         return {"content": [{"type": "text", "text": (
-            f"{target_lid}'s role ('{role}') already includes '{scope_id}' in its "
+            f"{target_id}'s role ('{role}') already includes '{scope_id}' in its "
             f"baseline reads. No grant needed."
         )}]}
     if result == "already":
         return {"content": [{"type": "text", "text": (
-            f"{target_lid} already has '{scope_id}' in their extra_reads. No change."
+            f"{target_id} already has '{scope_id}' in their extra_reads. No change."
         )}]}
     # result == "added"
     sync_err = _sync_subjects_to_gbrain(scopes_yaml_path)
     sync_note = (f"\n\n⚠️ Subjects sync warning: {sync_err}" if sync_err else "")
     _log("info", "grant_scope_access",
-         sender=sender_lid, target=target_lid, scope=scope_id)
+         sender=sender_id, target=target_id, scope=scope_id)
     return {"content": [{"type": "text", "text": (
-        f"✅ Granted `{scope_id}` read access to `{target_lid}`.{sync_note}\n\n"
+        f"✅ Granted `{scope_id}` read access to `{target_id}`.{sync_note}\n\n"
         f"Effective on their next message (gbrain RLS re-resolves on each "
         f"token-exchange). Stored as `extra_reads` in scopes.yaml so it "
         f"survives role changes.\n\n"
@@ -1712,7 +1711,7 @@ def _handle_grant_scope_access(
 def _handle_revoke_scope_access(
     args: Dict[str, Any],
     scopes_data: Dict[str, Any],
-    sender_lid: str,
+    sender_id: str,
     scopes_yaml_path: str,
 ) -> Dict[str, Any]:
     """Revoke one extra scope from a user. Super_admin only.
@@ -1722,25 +1721,25 @@ def _handle_revoke_scope_access(
     the user's role instead — chat-driven role-config edits are out of
     scope for v1 (they'd ripple to every user with that role).
     """
-    target_lid = str(args.get("target_lid") or "").strip()
+    target_id = str(args.get("target_id") or "").strip()
     scope_id = str(args.get("scope") or "").strip()
-    if not _is_super_admin(scopes_data, sender_lid):
+    if not _is_super_admin(scopes_data, sender_id):
         return {"isError": True, "content": [{"type": "text", "text": (
             "Scope revokes are restricted to super_admins."
         )}]}
-    if not _LID_RE.match(target_lid):
+    if not _SENDER_ID_RE.match(target_id):
         return {"isError": True, "content": [{"type": "text", "text": (
-            f"target_lid format invalid: '{target_lid}'."
+            f"target_sender_id format invalid: '{target_id}'."
         )}]}
     if not scope_id:
         return {"isError": True, "content": [{"type": "text", "text": (
             "scope is required."
         )}]}
     try:
-        result = _scopes_yaml_revoke_extra_read(scopes_yaml_path, target_lid, scope_id)
+        result = _scopes_yaml_revoke_extra_read(scopes_yaml_path, target_id, scope_id)
     except Exception as exc:
         _log("error", "revoke_scope_access write failed",
-             sender=sender_lid, target=target_lid, scope=scope_id, error=str(exc))
+             sender=sender_id, target=target_id, scope=scope_id, error=str(exc))
         return {"isError": True, "content": [{"type": "text", "text": (
             f"Failed to edit scopes.yaml: {exc}. No revoke applied."
         )}]}
@@ -1752,11 +1751,11 @@ def _handle_revoke_scope_access(
         )}]}
     if result == "not_found":
         return {"isError": True, "content": [{"type": "text", "text": (
-            f"User {target_lid} is not in scopes.yaml."
+            f"User {target_id} is not in scopes.yaml."
         )}]}
     if result == "super_admin":
         return {"isError": True, "content": [{"type": "text", "text": (
-            f"{target_lid} is a super_admin — their scope access comes from "
+            f"{target_id} is a super_admin — their scope access comes from "
             f"super_admin status, not extra_reads. To remove their access, use "
             f"revoke_user (will demote and trigger the soft-delete on their "
             f"subjects row)."
@@ -1764,11 +1763,11 @@ def _handle_revoke_scope_access(
     if result == "role_baseline":
         role = ""
         for e in (scopes_data.get("users") or []):
-            if str(e.get("id", "")).strip() == target_lid:
+            if str(e.get("id", "")).strip() == target_id:
                 role = str(e.get("role", "")).strip()
                 break
         return {"isError": True, "content": [{"type": "text", "text": (
-            f"`{scope_id}` is part of `{target_lid}`'s role ('{role}') baseline "
+            f"`{scope_id}` is part of `{target_id}`'s role ('{role}') baseline "
             f"reads — chat-driven revoke can't touch role definitions (would "
             f"ripple to every user with that role). To remove this access, "
             f"revoke_user and re-approve with a narrower role, or edit "
@@ -1776,16 +1775,16 @@ def _handle_revoke_scope_access(
         )}]}
     if result == "not_in_extra":
         return {"content": [{"type": "text", "text": (
-            f"`{target_lid}` doesn't have `{scope_id}` as an extra_read — "
+            f"`{target_id}` doesn't have `{scope_id}` as an extra_read — "
             f"nothing to revoke."
         )}]}
     # result == "removed"
     sync_err = _sync_subjects_to_gbrain(scopes_yaml_path)
     sync_note = (f"\n\n⚠️ Subjects sync warning: {sync_err}" if sync_err else "")
     _log("info", "revoke_scope_access",
-         sender=sender_lid, target=target_lid, scope=scope_id)
+         sender=sender_id, target=target_id, scope=scope_id)
     return {"content": [{"type": "text", "text": (
-        f"✅ Revoked `{scope_id}` extra read from `{target_lid}`.{sync_note}\n\n"
+        f"✅ Revoked `{scope_id}` extra read from `{target_id}`.{sync_note}\n\n"
         f"Effective on their next message. Their role baseline reads are "
         f"unchanged.\n\n"
         f"Note: the VM's scopes.yaml has diverged from the repo — Harris should "
@@ -1796,10 +1795,10 @@ def _handle_revoke_scope_access(
 
 def _handle_reload_gateway(
     scopes_data: Dict[str, Any],
-    sender_lid: str,
+    sender_id: str,
 ) -> Dict[str, Any]:
     """Restart hermes so allowlist changes load. Super_admin only."""
-    if not _is_super_admin(scopes_data, sender_lid):
+    if not _is_super_admin(scopes_data, sender_id):
         return {"isError": True, "content": [{"type": "text", "text": (
             "Restarting the gateway is restricted to super_admins."
         )}]}
@@ -1809,7 +1808,7 @@ def _handle_reload_gateway(
             "Couldn't trigger the restart. Restart manually via SSH: "
             "`sudo systemctl restart hermes`."
         )}]}
-    _log("info", "reload_gateway triggered", sender=sender_lid)
+    _log("info", "reload_gateway triggered", sender=sender_id)
     return {"content": [{"type": "text", "text": (
         "♻️ Restarting the gateway now — it reloads the allowlist on the way "
         "back up (~15-20s). This session ends; send a new message once it's "
@@ -1831,59 +1830,59 @@ def _handle_tools_call(
     name = str(params.get("name") or "")
     args = params.get("arguments") or {}
 
-    # v0.2: sender_lid is a REQUIRED per-call arg now (not a startup env var).
+    # v0.2: sender_id is a REQUIRED per-call arg now (not a startup env var).
     # Persona is responsible for passing the verified sender's lid here.
-    sender_lid = str(args.get("sender_lid") or "").strip()
-    if not _LID_RE.match(sender_lid):
+    sender_id = str(args.get("sender_id") or "").strip()
+    if not _SENDER_ID_RE.match(sender_id):
         _log(
             "warn",
-            "tool call refused — sender_lid missing or malformed",
+            "tool call refused — sender_id missing or malformed",
             tool=name,
-            sender_lid_received=sender_lid or "(empty)",
+            sender_id_received=sender_id or "(empty)",
         )
         return {
             "isError": True,
             "content": [{
                 "type": "text",
                 "text": (
-                    "sender_lid required: every hermes_save:* call must "
+                    "sender_id required: every hermes_save:* call must "
                     "include the verified sender's lid (format "
-                    "`<digits>@lid`) as the `sender_lid` argument. "
+                    "`<wa_id digits>`) as the `sender_id` argument. "
                     "Source it from the most recent <verified_sender "
                     "id=\"...\"/> marker on the user's message; "
                     "never invent it."
                 ),
             }],
         }
-    role = _resolve_role(scopes_data, sender_lid)
+    role = _resolve_role(scopes_data, sender_id)
 
     session_dir = _session_dir_for(env_path)
     if name == "approve_user":
         return _handle_approve_user(
-            args, scopes_data, sender_lid, role, scopes_yaml_path, session_dir,
+            args, scopes_data, sender_id, role, scopes_yaml_path, session_dir,
         )
     if name == "add_to_allowlist":
-        return _handle_add_to_allowlist(args, scopes_data, sender_lid, env_path)
+        return _handle_add_to_allowlist(args, scopes_data, sender_id, env_path)
     if name == "record_pending_user":
         return _handle_record_pending_user(args, pending_path)
     if name == "list_pending_users":
         return _handle_list_pending_users(
-            scopes_data, sender_lid, pending_path, env_path, session_dir,
+            scopes_data, sender_id, pending_path, env_path, session_dir,
         )
     if name == "list_allowlist":
-        return _handle_list_allowlist(scopes_data, sender_lid, env_path, session_dir)
+        return _handle_list_allowlist(scopes_data, sender_id, env_path, session_dir)
     if name == "remove_from_allowlist":
-        return _handle_remove_from_allowlist(args, scopes_data, sender_lid, env_path)
+        return _handle_remove_from_allowlist(args, scopes_data, sender_id, env_path)
     if name == "revoke_user":
         return _handle_revoke_user(
-            args, scopes_data, sender_lid, scopes_yaml_path, pending_path,
+            args, scopes_data, sender_id, scopes_yaml_path, pending_path,
         )
     if name == "grant_scope_access":
-        return _handle_grant_scope_access(args, scopes_data, sender_lid, scopes_yaml_path)
+        return _handle_grant_scope_access(args, scopes_data, sender_id, scopes_yaml_path)
     if name == "revoke_scope_access":
-        return _handle_revoke_scope_access(args, scopes_data, sender_lid, scopes_yaml_path)
+        return _handle_revoke_scope_access(args, scopes_data, sender_id, scopes_yaml_path)
     if name == "reload_gateway":
-        return _handle_reload_gateway(scopes_data, sender_lid)
+        return _handle_reload_gateway(scopes_data, sender_id)
     if name != "save_to_scope":
         return {
             "isError": True,
@@ -1918,7 +1917,7 @@ def _handle_tools_call(
         _log(
             "warn",
             "no role resolved for sender",
-            sender=sender_lid,
+            sender=sender_id,
             scope=scope,
         )
         return {
@@ -1935,7 +1934,7 @@ def _handle_tools_call(
         _log(
             "warn",
             "role not authorized for scope",
-            sender=sender_lid,
+            sender=sender_id,
             role=role,
             scope=scope,
         )
@@ -1971,7 +1970,7 @@ def _handle_tools_call(
         _log(
             "error",
             "no bearer available for writer_role",
-            sender=sender_lid,
+            sender=sender_id,
             role=role,
             scope=scope,
             writer_role=writer_role,
@@ -1992,7 +1991,7 @@ def _handle_tools_call(
     _log(
         "info",
         "save_to_scope dispatch",
-        sender=sender_lid,
+        sender=sender_id,
         role=role,
         scope=scope,
         writer_role=writer_role,
@@ -2026,9 +2025,9 @@ def _handle_tools_call(
     # Pass through gbrain's tool result if present; otherwise return the raw envelope
     inner = (result or {}).get("result")
     if isinstance(inner, dict) and ("content" in inner or "isError" in inner):
-        _log("info", "save_to_scope success", sender=sender_lid, scope=scope)
+        _log("info", "save_to_scope success", sender=sender_id, scope=scope)
         return inner
-    _log("info", "save_to_scope returned raw envelope", sender=sender_lid, scope=scope)
+    _log("info", "save_to_scope returned raw envelope", sender=sender_id, scope=scope)
     return {
         "content": [{
             "type": "text",
@@ -2079,7 +2078,7 @@ def main() -> int:
     # v0.2: no per-session env. The server is launched ONCE by
     # hermes-agent (via config.yaml mcp_servers) and stays up for the
     # lifetime of the gateway. Every tool call carries its own
-    # sender_lid arg.
+    # sender_id arg.
     scopes_yaml_path = _env("HERMES_SCOPES_YAML") or ""
     bearers_path = _env("HERMES_BEARERS_FILE") or "/home/hermes-user/.hermes/role-bearers.json"
     gbrain_url = _env("HERMES_GBRAIN_URL") or "http://127.0.0.1:7777"

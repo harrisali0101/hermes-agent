@@ -64,19 +64,19 @@ _PROTOCOL_VERSION = "2024-11-05"
 _SERVER_NAME = "hermes-read"
 _SERVER_VERSION = "0.1.0"
 
-_LID_RE = re.compile(r"^\d{6,}@lid$")
+_SENDER_ID_RE = re.compile(r"^\d{8,15}$")
 
-# The sender_lid contract is IDENTICAL to hermes_save_mcp.py: every tool
-# call carries the verified sender's WhatsApp lid as a per-call arg.
+# The sender_id contract is IDENTICAL to hermes_save_mcp.py: every tool
+# call carries the verified sender's WhatsApp wa_id as a per-call arg.
 # Persona is responsible for sourcing it verbatim from the most recent
 # <verified_sender id="..."/> marker on the user's message. Missing /
 # malformed → server refuses the call, never falls back to a default.
 _SENDER_LID_SCHEMA: Dict[str, Any] = {
     "type": "string",
-    "pattern": r"^\d{6,}@lid$",
+    "pattern": r"^\d{8,15}$",
     "description": (
-        "REQUIRED. The verified sender's WhatsApp lid (format "
-        "`<digits>@lid`), copied verbatim from the most recent "
+        "REQUIRED. The verified sender's WhatsApp wa_id (format "
+        "`<wa_id digits>`), copied verbatim from the most recent "
         "<verified_sender id=\"...\"/> marker on the user's message. "
         "Hermes mints a per-turn gbrain access token bound to this "
         "subject via RFC 8693 OAuth Token Exchange; gbrain enforces "
@@ -125,15 +125,15 @@ def _load_yaml(path: str) -> Dict[str, Any]:
         return {}
 
 
-def _resolve_role(scopes_data: Dict[str, Any], sender_lid: str) -> Optional[str]:
+def _resolve_role(scopes_data: Dict[str, Any], sender_id: str) -> Optional[str]:
     """Look up sender role for audit logging. Returns None if not found —
     that's allowed: gbrain still enforces RLS via the subjects table even
     when this side can't classify the role. We just log "role=unknown"."""
     for entry in scopes_data.get("super_admins") or []:
-        if str(entry.get("id", "")).strip() == sender_lid:
+        if str(entry.get("id", "")).strip() == sender_id:
             return "super_admin"
     for entry in scopes_data.get("users") or []:
-        if str(entry.get("id", "")).strip() == sender_lid:
+        if str(entry.get("id", "")).strip() == sender_id:
             return str(entry.get("role", "")).strip() or None
     return None
 
@@ -216,7 +216,7 @@ def _handle_tools_list() -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sender_lid": _SENDER_LID_SCHEMA,
+                        "sender_id": _SENDER_LID_SCHEMA,
                         "q": {"type": "string", "description": "Natural-language query."},
                         "limit": {
                             "type": "integer",
@@ -224,7 +224,7 @@ def _handle_tools_list() -> Dict[str, Any]:
                             "minimum": 1, "maximum": 50,
                         },
                     },
-                    "required": ["sender_lid", "q"],
+                    "required": ["sender_id", "q"],
                 },
             },
             {
@@ -239,7 +239,7 @@ def _handle_tools_list() -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sender_lid": _SENDER_LID_SCHEMA,
+                        "sender_id": _SENDER_LID_SCHEMA,
                         "q": {"type": "string", "description": "Exact keywords or phrase."},
                         "limit": {
                             "type": "integer",
@@ -247,7 +247,7 @@ def _handle_tools_list() -> Dict[str, Any]:
                             "minimum": 1, "maximum": 50,
                         },
                     },
-                    "required": ["sender_lid", "q"],
+                    "required": ["sender_id", "q"],
                 },
             },
             {
@@ -263,10 +263,10 @@ def _handle_tools_list() -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sender_lid": _SENDER_LID_SCHEMA,
+                        "sender_id": _SENDER_LID_SCHEMA,
                         "slug": {"type": "string", "description": "Page slug (kebab-case)."},
                     },
-                    "required": ["sender_lid", "slug"],
+                    "required": ["sender_id", "slug"],
                 },
             },
             {
@@ -282,14 +282,14 @@ def _handle_tools_list() -> Dict[str, Any]:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "sender_lid": _SENDER_LID_SCHEMA,
+                        "sender_id": _SENDER_LID_SCHEMA,
                         "limit": {
                             "type": "integer",
                             "description": "Max pages (default 25).",
                             "minimum": 1, "maximum": 200,
                         },
                     },
-                    "required": ["sender_lid"],
+                    "required": ["sender_id"],
                 },
             },
         ]
@@ -304,7 +304,7 @@ def _handle_tools_call(
     timeout: float,
 ) -> Dict[str, Any]:
     """Dispatch a read tool call. Steps:
-      1. Validate sender_lid (refuse if missing/malformed).
+      1. Validate sender_id (refuse if missing/malformed).
       2. Mint a per-subject access token via the gbrain_exchange.TokenCache.
       3. Forward the tool call to gbrain /mcp with that bearer.
       4. On 401 → invalidate cache so next call re-mints (handles the
@@ -314,18 +314,18 @@ def _handle_tools_call(
     name = str(params.get("name") or "")
     args = params.get("arguments") or {}
 
-    sender_lid = str(args.get("sender_lid") or "").strip()
-    if not _LID_RE.match(sender_lid):
-        _log("warn", "tool call refused — sender_lid missing or malformed",
-             tool=name, sender_lid_received=sender_lid or "(empty)")
+    sender_id = str(args.get("sender_id") or "").strip()
+    if not _SENDER_ID_RE.match(sender_id):
+        _log("warn", "tool call refused — sender_id missing or malformed",
+             tool=name, sender_id_received=sender_id or "(empty)")
         return {
             "isError": True,
             "content": [{
                 "type": "text",
                 "text": (
-                    "sender_lid required: every hermes_read:* call must "
+                    "sender_id required: every hermes_read:* call must "
                     "include the verified sender's lid (format "
-                    "`<digits>@lid`) as the `sender_lid` argument. "
+                    "`<wa_id digits>`) as the `sender_id` argument. "
                     "Source it from the most recent <verified_sender "
                     "id=\"...\"/> marker on the user's message; never "
                     "invent it."
@@ -385,11 +385,11 @@ def _handle_tools_call(
         # actually wants 95% of the time.
         gbrain_args.setdefault("sort", "updated_desc")
 
-    role = _resolve_role(scopes_data, sender_lid)
+    role = _resolve_role(scopes_data, sender_id)
     try:
-        bearer = token_cache.for_subject(sender_lid)
+        bearer = token_cache.for_subject(sender_id)
     except Exception as exc:
-        _log("error", "token exchange failed", sender=sender_lid, tool=name, error=str(exc))
+        _log("error", "token exchange failed", sender=sender_id, tool=name, error=str(exc))
         return {
             "isError": True,
             "content": [{
@@ -404,7 +404,7 @@ def _handle_tools_call(
         }
 
     _log("info", "subject read dispatch",
-         sender=sender_lid, role=role or "unknown",
+         sender=sender_id, role=role or "unknown",
          tool=name, args_keys=sorted(gbrain_args.keys()))
 
     try:
@@ -421,7 +421,7 @@ def _handle_tools_call(
         # state, and we never want this branch to mask the original 401.
         if exc.code == 401:
             try:
-                token_cache.invalidate(sender_lid)
+                token_cache.invalidate(sender_id)
             except Exception:
                 pass
         _log("error", "gbrain read HTTPError",

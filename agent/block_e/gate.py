@@ -1,7 +1,7 @@
 """Block E gate — engage citation enforcement only on EXPLICIT user invocation.
 
 Public entrypoint:
-  ``run_gate(user_message, response_text, sender_lid, agent_name,
+  ``run_gate(user_message, response_text, sender_id, agent_name,
              lookback_seconds) -> str``
 
 v0.3 decision tree (user-intent only — retrieval signal removed):
@@ -102,7 +102,7 @@ _OPERATIONAL_PATTERNS = [
     r"\bis restricted to super_admins\b",
     r"\bsaved to (the )?(general|leadership|finance|super_admin|ceos) scope\b",
     r"\bphone format invalid\b",
-    r"\btarget_lid format invalid\b",
+    r"\btarget_sender_id format invalid\b",
     r"\brole '\w+' is not defined\b",
     # Diagnostic / introspection output shapes — bot reporting raw tool
     # output to the operator, NOT making knowledge claims.
@@ -139,7 +139,7 @@ def _dry_run() -> bool:
 def run_gate(
     user_message: str,
     response_text: str,
-    sender_lid: str,
+    sender_id: str,
     agent_name: Optional[str],
     lookback_seconds: int = 120,
 ) -> str:
@@ -166,7 +166,7 @@ def run_gate(
         logger.info(
             "block_e: pass-through (operational/diagnostic request) "
             "| sender=%s len=%d",
-            sender_lid, len(response_text),
+            sender_id, len(response_text),
         )
         return response_text
 
@@ -178,7 +178,7 @@ def run_gate(
         logger.info(
             "block_e: pass-through (user did not explicitly invoke brain) "
             "| sender=%s len=%d",
-            sender_lid, len(response_text),
+            sender_id, len(response_text),
         )
         return response_text
 
@@ -188,7 +188,7 @@ def run_gate(
     if _looks_operational(response_text):
         logger.info(
             "block_e: pass-through (operational tool result) | sender=%s",
-            sender_lid,
+            sender_id,
         )
         return response_text
 
@@ -197,7 +197,7 @@ def run_gate(
     if not citations and _looks_like_self_refusal(response_text):
         logger.info(
             "block_e: pass-through (self-refusal, no citation) | sender=%s",
-            sender_lid,
+            sender_id,
         )
         return response_text
 
@@ -205,7 +205,7 @@ def run_gate(
         logger.warning(
             "block_e: REFUSE (explicit brain invocation, no citation) "
             "| sender=%s agent=%s",
-            sender_lid, agent_name,
+            sender_id, agent_name,
         )
         if _dry_run():
             return response_text + "\n\n[gate would refuse: no citation]"
@@ -215,7 +215,7 @@ def run_gate(
     footer = format_references_footer(citations)
     logger.info(
         "block_e: PASS | sender=%s agent=%s citations=%d",
-        sender_lid, agent_name, len(citations),
+        sender_id, agent_name, len(citations),
     )
     if footer:
         return cleaned.rstrip() + "\n\n" + footer
