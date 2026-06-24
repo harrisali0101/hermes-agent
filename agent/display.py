@@ -193,6 +193,7 @@ _TOOL_FRIENDLY_LABELS: dict[str, str] = {
     "mcp_hermes_save_remove_from_allowlist":  "Removing from allowlist",
     "mcp_hermes_save_revoke_user":            "Revoking user",
     "mcp_hermes_save_reload_gateway":         "Reloading the gateway",
+    "mcp_hermes_save_send_template_message":  "Sending welcome template",
     "read_file":            "Reading the file",
     "write_file":           "Writing to file",
     "edit_file":            "Editing the file",
