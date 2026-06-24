@@ -577,6 +577,68 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                     "required": ["sender_id"],
                 },
             },
+            {
+                "name": "send_template_message",
+                "description": (
+                    "Send a Meta-approved WhatsApp template message to any "
+                    "phone number. Templates are how you initiate a "
+                    "conversation OUTSIDE the 24-hour customer service "
+                    "window — required for cold outreach (e.g. an "
+                    "onboarding welcome). Calls Meta's Graph API "
+                    "/{phone_number_id}/messages with a template payload. "
+                    "Use the default template 'hermes_onboarding_message' "
+                    "to send the standard 'Yes, let's start' welcome card "
+                    "as part of the onboarding flow "
+                    "(add_to_allowlist → reload_gateway → send_template_message "
+                    "→ wait for tap → approve_user). Super_admin only. The "
+                    "recipient must be addressable via WhatsApp; Meta will "
+                    "return an error if the number is invalid or unreachable."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sender_id": _SENDER_LID_SCHEMA,
+                        "target_phone": {
+                            "type": "string",
+                            "description": (
+                                "Recipient phone number, digits only, no '+'. "
+                                "Example: 923333717117 for +92 333 3717117. "
+                                "International format; country code first."
+                            ),
+                        },
+                        "template_name": {
+                            "type": "string",
+                            "description": (
+                                "Meta-approved template name. Defaults to "
+                                "'hermes_onboarding_message' (the standard "
+                                "DIH onboarding welcome). Must match a "
+                                "template that's been APPROVED in your "
+                                "Meta Business Manager — pending or rejected "
+                                "templates return an error."
+                            ),
+                        },
+                        "language_code": {
+                            "type": "string",
+                            "description": (
+                                "BCP-47 language code matching the approved "
+                                "template variant. Defaults to 'en'. Common "
+                                "alternatives: 'en_US', 'es', 'ar'."
+                            ),
+                        },
+                        "recipient_name": {
+                            "type": "string",
+                            "description": (
+                                "Optional human-readable name for the "
+                                "recipient — used only in the tool's "
+                                "confirmation message back to the operator "
+                                "(e.g. 'Template sent to Jane Doe at "
+                                "923xxx'). NOT passed to Meta."
+                            ),
+                        },
+                    },
+                    "required": ["sender_id", "target_phone"],
+                },
+            },
         ]
     }
 
@@ -1795,6 +1857,118 @@ def _handle_reload_gateway(
     )}]}
 
 
+def _handle_send_template_message(
+    args: Dict[str, Any],
+    scopes_data: Dict[str, Any],
+    sender_id: str,
+) -> Dict[str, Any]:
+    """Send a Meta-approved WhatsApp template message via the Graph API.
+    Super_admin only. Reads access_token + phone_number_id from the env
+    (set by fetch-secrets.sh from KV)."""
+    if not _is_super_admin(scopes_data, sender_id):
+        _log("warn", "send_template_message denied", sender=sender_id)
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "Sending template messages is restricted to super_admins."
+        )}]}
+
+    target_phone = str(args.get("target_phone") or "").strip().lstrip("+").replace(" ", "")
+    template_name = str(args.get("template_name") or "hermes_onboarding_message").strip()
+    language_code = str(args.get("language_code") or "en").strip()
+    recipient_name = str(args.get("recipient_name") or "").strip()
+
+    if not _PHONE_RE.match(target_phone):
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"target_phone format invalid: '{target_phone}'. Expected digits "
+            f"only, 9-15 chars, no '+' (e.g., 923333717117 for "
+            f"+92 333 3717117)."
+        )}]}
+
+    access_token = os.environ.get("WHATSAPP_CLOUD_ACCESS_TOKEN", "").strip()
+    phone_number_id = os.environ.get("WHATSAPP_CLOUD_PHONE_NUMBER_ID", "").strip()
+    api_version = os.environ.get("WHATSAPP_CLOUD_API_VERSION", "v20.0").strip() or "v20.0"
+
+    if not access_token or not phone_number_id:
+        return {"isError": True, "content": [{"type": "text", "text": (
+            "Cloud API credentials missing from hermes env "
+            "(WHATSAPP_CLOUD_ACCESS_TOKEN / WHATSAPP_CLOUD_PHONE_NUMBER_ID). "
+            "Restart hermes via SSH so fetch-secrets.sh re-exports them from KV."
+        )}]}
+
+    url = f"https://graph.facebook.com/{api_version}/{phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": target_phone,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": language_code},
+        },
+    }
+
+    try:
+        import urllib.request
+        import urllib.error
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body) if body else {}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        _log(
+            "error", "send_template_message graph api HTTPError",
+            sender=sender_id, target=target_phone, template=template_name,
+            status=e.code, body=err_body[:500],
+        )
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"Graph API returned HTTP {e.code} for template '{template_name}' "
+            f"to {target_phone}. Common causes: template not approved in "
+            f"Meta Business Manager, invalid template name, language code "
+            f"mismatch (need an approved variant), number not on WhatsApp, "
+            f"or recipient outside our 24h window AND template marked "
+            f"non-marketing. Meta response: {err_body[:500] or '(empty)'}"
+        )}]}
+    except Exception as e:
+        _log(
+            "error", "send_template_message network failure",
+            sender=sender_id, target=target_phone, template=template_name,
+            error=str(e),
+        )
+        return {"isError": True, "content": [{"type": "text", "text": (
+            f"Couldn't reach the Graph API: {e}. Check the VM's outbound "
+            f"network + the access token freshness."
+        )}]}
+
+    wamid = None
+    try:
+        wamid = data.get("messages", [{}])[0].get("id")
+    except Exception:
+        pass
+
+    _log(
+        "info", "send_template_message accepted",
+        sender=sender_id, target=target_phone, template=template_name,
+        wamid=wamid,
+    )
+
+    display_who = f"{recipient_name} at {target_phone}" if recipient_name else target_phone
+    return {"content": [{"type": "text", "text": (
+        f"📨 Template '{template_name}' ({language_code}) sent to "
+        f"{display_who}. Meta returned message_status: accepted "
+        f"(wamid: `{wamid or '?'}`).\n\n"
+        f"Next: the recipient will receive the template card. Once they "
+        f"tap a button or reply, the 24-hour customer service window "
+        f"opens and you can run `approve_user` to assign their final role."
+    )}]}
+
+
 def _handle_tools_call(
     req: Dict[str, Any],
     scopes_data: Dict[str, Any],
@@ -1861,6 +2035,8 @@ def _handle_tools_call(
         return _handle_revoke_scope_access(args, scopes_data, sender_id, scopes_yaml_path)
     if name == "reload_gateway":
         return _handle_reload_gateway(scopes_data, sender_id)
+    if name == "send_template_message":
+        return _handle_send_template_message(args, scopes_data, sender_id)
     if name != "save_to_scope":
         return {
             "isError": True,
