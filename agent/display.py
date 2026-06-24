@@ -160,18 +160,62 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
     return default
 
 
-# Friendly tool-progress labels. **Empty by default** — operators populate
-# their map in personal-agent config.yaml (see azure/config/config.yaml in
-# the personal-agent repo for the DIH-flavored set: "Searching the brain",
-# "Reading the document", etc.). The mechanism stays here; the OPINION
-# (the actual label strings) lives in operator config so the upstream
-# default is non-opinionated. Anything not in the map falls back to the
-# raw tool name — matches upstream behavior pre-rebase.
+# Friendly tool-progress labels for non-technical chat users (WhatsApp /
+# Slack / Telegram). Maps raw tool names to human verbs so chat readouts
+# read naturally ("Searching the brain" beats "mcp_gbrain_query"). Anything
+# unmapped falls back to the raw tool name.
 #
-# This shape mirrors the design in PR #51869 (config-driven labels) so when
-# that PR merges upstream, the only change on our side is to drop this
-# module-level dict entirely and read from display_config.
-_TOOL_FRIENDLY_LABELS: dict[str, str] = {}
+# 2026-06-24: restored DIH-flavored labels after PR-C upstream wiring
+# turned out to be incomplete on the rebased tree (gateway/display_config
+# does not register `tool_labels` in _GLOBAL_DEFAULTS, so the operator-
+# config path was a no-op). Once PR #51869 lands upstream — or once we
+# wire display_config.tool_labels here ourselves — this dict moves out
+# of code into operator config.
+_TOOL_FRIENDLY_LABELS: dict[str, str] = {
+    "mcp_gbrain_query":                       "Searching the brain",
+    "mcp_gbrain_search":                      "Searching the brain (keywords)",
+    "mcp_gbrain_get_recent_salience":         "Checking what's new",
+    "mcp_gbrain_list_pages":                  "Listing recent documents",
+    "mcp_gbrain_get_page":                    "Reading the document",
+    "mcp_gbrain_get_chunks":                  "Pulling sections",
+    "mcp_gbrain_put_page":                    "Saving to the brain",
+    "mcp_gbrain_find_experts":                "Finding who knows this",
+    "mcp_hermes_read_query":                  "Searching the brain",
+    "mcp_hermes_read_search":                 "Searching the brain (keywords)",
+    "mcp_hermes_read_get_page":               "Reading the document",
+    "mcp_hermes_read_list_pages":             "Listing recent documents",
+    "mcp_hermes_save_save_to_scope":          "Saving to the brain",
+    "mcp_hermes_save_add_to_allowlist":       "Adding user to allowlist",
+    "mcp_hermes_save_approve_user":           "Approving user",
+    "mcp_hermes_save_record_pending_user":    "Recording pending user",
+    "mcp_hermes_save_list_pending_users":     "Checking pending users",
+    "mcp_hermes_save_list_allowlist":         "Checking the allowlist",
+    "mcp_hermes_save_remove_from_allowlist":  "Removing from allowlist",
+    "mcp_hermes_save_revoke_user":            "Revoking user",
+    "mcp_hermes_save_reload_gateway":         "Reloading the gateway",
+    "read_file":            "Reading the file",
+    "write_file":           "Writing to file",
+    "edit_file":            "Editing the file",
+    "patch":                "Patching the file",
+    "search_files":         "Searching files",
+    "list_files":           "Listing files",
+    "terminal":             "Running a command",
+    "bash":                 "Running a command",
+    "process":              "Managing a process",
+    "web_search":           "Searching the web",
+    "web_fetch":            "Fetching webpage",
+    "web_extract":          "Extracting from webpage",
+    "deep_research":        "Doing deep research",
+    "think":                "Thinking through this",
+    "clarify":              "Asking for clarification",
+    "delegate_task":        "Delegating a sub-task",
+    "image_generate":       "Generating an image",
+    "vision_analyze":       "Analysing the image",
+    "text_to_speech":       "Generating voice reply",
+    "skill_view":           "Looking up a skill",
+    "skills_list":          "Listing skills",
+    "skill_manage":         "Managing a skill",
+}
 
 
 def get_tool_friendly_label(tool_name: str) -> str:
