@@ -1793,15 +1793,25 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             text = raw_message.get("text") or {}
             body = str(text.get("body") or "")
         elif msg_type_str in {"button", "interactive"}:
-            # Quick-reply buttons. Treat the button payload as text so the
-            # agent can reason about the user's choice.
+            # Quick-reply buttons / list selections. Surface the button's
+            # PAYLOAD (or id) as a structured prefix the persona can match
+            # deterministically — without it, "Yes, let's start" from a
+            # template tap is indistinguishable from a user just typing
+            # those three words. The persona's onboarding rule keys off
+            # the [button:<payload>] tag so it knows this was triggered
+            # by the hermes_onboarding_message template button.
             if msg_type_str == "button":
-                body = str((raw_message.get("button") or {}).get("text") or "")
+                btn = raw_message.get("button") or {}
+                _text = str(btn.get("text") or "")
+                _payload = str(btn.get("payload") or "").strip() or _text
+                body = f"[button:{_payload}] {_text}".strip() if _text else f"[button:{_payload}]"
             else:
                 inter = raw_message.get("interactive") or {}
-                # button_reply / list_reply both expose ``title``
+                # button_reply uses ``id`` + ``title``; list_reply uses ``id`` + ``title``.
                 inner = inter.get("button_reply") or inter.get("list_reply") or {}
-                body = str(inner.get("title") or "")
+                _title = str(inner.get("title") or "")
+                _id = str(inner.get("id") or "").strip() or _title
+                body = f"[button:{_id}] {_title}".strip() if _title else f"[button:{_id}]"
         elif msg_type_str in {"image", "video", "audio", "voice", "document", "sticker"}:
             # Captions live on image / video / document. Other media types
             # don't carry a caption in Meta's spec, but be defensive.
