@@ -26,14 +26,36 @@ from __future__ import annotations
 import re
 from typing import List, Tuple
 
-# slug:[a-z0-9-./], 2-120 chars, optional `:section` (`a-z0-9-`).
-# Negative lookahead rejects multi-word English ([really nice], [sic erat]).
-_CITATION_RE = re.compile(
+# Slug-shape citations — lowercase kebab-case, e.g.
+# `[attach-2026-06-17-13861000-505035058v9-project-mesec-buyer-b322db]`.
+# Kept for backward compat + system-emitted slugs from gbrain tools.
+_SLUG_CITATION_RE = re.compile(
     r"\[(?P<slug>\.?[a-z][a-z0-9\-./]{1,118}[a-z0-9])(?::(?P<section>[a-z0-9\-]{1,60}))?\]",
     re.IGNORECASE,
 )
 
-# Common false positives the bot/model emits in brackets. Lowercase compare.
+# Human-readable TITLE citations — e.g.
+# `[v9 Buyer Closing Checklist — 17 June]`,
+# `[Mandate Letter execution version — 18 June 18:58 UTC]`.
+# STATUS_QUERY.md instructs the model to cite by page title for chat-
+# friendly output. To distinguish citations from incidental brackets
+# (`[done]`, `[42]`, `[really nice]`) we REQUIRE at least one
+# date/version/time anchor inside the title text.
+_TITLE_CITATION_RE = re.compile(r"\[(?P<title>[^\[\]\n]{10,200})\]")
+_TITLE_ANCHOR_RE = re.compile(
+    # Month name (English short or long)
+    r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?"
+    r"|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\b"
+    # ISO date YYYY-MM-DD
+    r"|\b\d{4}-\d{2}-\d{2}\b"
+    # Version token (v9, v0.2.1, v2024-06)
+    r"|\bv\d+(?:[\.\-]\d+)*\b"
+    # Time HH:MM (with optional UTC/GMT/PKT/EST/PST/IST)
+    r"|\b\d{1,2}:\d{2}\b",
+    re.IGNORECASE,
+)
+
+# Common false positives in brackets. Lowercase compare.
 _FALSE_POSITIVES = {
     "done", "ok", "okay", "x", " ", "tbd", "wip", "n/a", "na", "tbc",
     "redacted", "sic", "citation needed", "see above", "above",
@@ -43,42 +65,78 @@ _FALSE_POSITIVES = {
 }
 
 
+def _is_slug_shape(text: str) -> bool:
+    """True when the citation key looks like a technical slug (lowercase
+    kebab-case with optional digits / dots / slashes)."""
+    if not text:
+        return False
+    if any(ch.isspace() for ch in text):
+        return False
+    return bool(re.fullmatch(r"\.?[a-z][a-z0-9\-./]+", text))
+
+
 def extract_citations(text: str) -> List[Tuple[str, str]]:
-    """Return list of ``(slug, section_or_empty)`` tuples in source order,
-    deduplicated by slug.
+    """Return list of ``(citation_key, section_or_empty)`` tuples in
+    source order, deduplicated. The citation key is either a slug
+    (lowercase kebab-case) OR a human-readable title that contains
+    a date/version/time anchor.
     """
     if not text:
         return []
     seen: set[str] = set()
     out: List[Tuple[str, str]] = []
-    for m in _CITATION_RE.finditer(text):
-        slug = (m.group("slug") or "").strip().lower()
+    # Single pass: match every [...] block, classify each.
+    for m in re.finditer(r"\[(?P<body>[^\[\]\n]{1,200})\](?::(?P<section>[a-z0-9\-]{1,60}))?", text, re.IGNORECASE):
+        body = (m.group("body") or "").strip()
         section = (m.group("section") or "").strip().lower()
-        if slug in _FALSE_POSITIVES or slug.replace("-", "").isdigit():
+        if not body:
             continue
-        if slug in seen:
+        key_lower = body.lower()
+        if key_lower in _FALSE_POSITIVES:
             continue
-        seen.add(slug)
-        out.append((slug, section))
+        if body.replace("-", "").replace(" ", "").isdigit():
+            continue
+        # Accept if either: slug-shape OR title with a date/version anchor.
+        is_slug = _is_slug_shape(body)
+        has_anchor = bool(_TITLE_ANCHOR_RE.search(body))
+        if not (is_slug or has_anchor):
+            continue
+        dedupe_key = key_lower if is_slug else body  # titles keep case for display
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        out.append((body if not is_slug else key_lower, section))
     return out
 
 
 def strip_inline_citations(text: str) -> str:
-    """Remove ``[slug]`` and ``[slug:section]`` markers from the response
-    body so the user sees clean prose. We don't try to fix surrounding
-    punctuation — the bot is instructed to write text that reads naturally
-    without the brackets.
+    """Remove citation markers from the response body so the user sees
+    clean prose. Recognises both slug-shape and title-shape citations
+    (same rules as ``extract_citations``).
     """
     if not text:
         return text
 
     def _replace(m: re.Match) -> str:
-        slug = (m.group("slug") or "").strip().lower()
-        if slug in _FALSE_POSITIVES or slug.replace("-", "").isdigit():
-            return m.group(0)  # leave it alone
+        body = (m.group("body") or "").strip()
+        if not body:
+            return m.group(0)
+        if body.lower() in _FALSE_POSITIVES:
+            return m.group(0)
+        if body.replace("-", "").replace(" ", "").isdigit():
+            return m.group(0)
+        is_slug = _is_slug_shape(body)
+        has_anchor = bool(_TITLE_ANCHOR_RE.search(body))
+        if not (is_slug or has_anchor):
+            return m.group(0)
         return ""
 
-    cleaned = _CITATION_RE.sub(_replace, text)
+    cleaned = re.sub(
+        r"\[(?P<body>[^\[\]\n]{1,200})\](?::(?P<section>[a-z0-9\-]{1,60}))?",
+        _replace,
+        text,
+        flags=re.IGNORECASE,
+    )
     # Collapse runs of spaces created by removal, preserve newlines.
     cleaned = re.sub(r" {2,}", " ", cleaned)
     # Drop space before punctuation introduced by removal: " ." → "."
@@ -151,22 +209,25 @@ def prettify_slug(slug: str) -> str:
 def format_references_footer(citations: List[Tuple[str, str]]) -> str:
     """Render the "Sources:" footer the bot appends after a passing turn.
 
-    Each entry shows the prettified slug followed by the canonical slug in
-    parens so the audit anchor stays intact. Returns an empty string when
-    there are no citations.
+    Two citation shapes are supported (see ``extract_citations``):
+    - Technical slug (lowercase kebab-case) → run through ``prettify_slug``
+      to produce a human label, then show the canonical slug in brackets
+      as the audit anchor.
+    - Human-readable title (already prettified by the model per STATUS_QUERY)
+      → pass through as-is; no further prettification.
 
-    Example output (one citation):
-        Source: 📎 2026-06-17 · project-mesec-buyer (v9) [attach-2026-06-17-…-b322db]
+    Returns an empty string when there are no citations.
     """
     if not citations:
         return ""
     parts: List[str] = []
-    for slug, section in citations:
-        pretty = prettify_slug(slug)
-        if pretty != slug:
-            entry = f"{pretty} [{slug}]"
+    for citation_key, section in citations:
+        if _is_slug_shape(citation_key):
+            pretty = prettify_slug(citation_key)
+            entry = f"{pretty} [{citation_key}]" if pretty != citation_key else citation_key
         else:
-            entry = slug
+            # Human-readable title — already in its display form.
+            entry = citation_key
         if section:
             entry = f"{entry} (§{section})"
         parts.append(entry)
