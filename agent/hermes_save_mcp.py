@@ -10,7 +10,7 @@ gbrain.
 v0.2 (2026-06-18): per-call sender_id arg instead of per-session env var.
 Required because the new azure-foundry provider doesn't have the
 per-session --mcp-config injection path the previous claude-code-cli
-provider used to pass HERMES_SENDER_LID at startup. With the new design
+provider used to pass HERMES_SENDER_ID at startup. With the new design
 the server is launched ONCE by hermes-agent (via config.yaml's
 mcp_servers block) and stays up across all sessions; the persona is
 responsible for adding the verified sender's lid to every tool call.

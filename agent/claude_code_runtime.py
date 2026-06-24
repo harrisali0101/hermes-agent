@@ -540,7 +540,7 @@ def _write_per_session_mcp_config(
     agent,
     access_token: str,
     bearers_path: Optional[str] = None,
-    sender_lid: Optional[str] = None,
+    sender_id: Optional[str] = None,
 ) -> Optional[str]:
     """Write a per-session claude-mcp.json with the role-scoped bearer.
 
@@ -578,7 +578,7 @@ def _write_per_session_mcp_config(
             "headers": {"Authorization": f"Bearer {access_token}"},
         }
     }
-    if bearers_path and sender_lid:
+    if bearers_path and sender_id:
         # Resolve the on-disk location of hermes_save_mcp.py (sibling of this file).
         save_mcp_module = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -589,7 +589,7 @@ def _write_per_session_mcp_config(
             "command": sys.executable or "python3",
             "args": [save_mcp_module],
             "env": {
-                "HERMES_SENDER_LID": sender_lid,
+                "HERMES_SENDER_ID": sender_id,
                 "HERMES_SCOPES_YAML": _SCOPES_YAML_PATH,
                 "HERMES_BEARERS_FILE": bearers_path,
                 "HERMES_GBRAIN_URL": _GBRAIN_BASE_URL,
@@ -622,7 +622,7 @@ def _resolve_per_session_mcp_config(agent) -> Optional[str]:
         sender's bound source_id only).
     """
     role = _resolve_role_for_sender(agent)
-    sender_lid = str(getattr(agent, "_user_id", "") or "").strip()
+    sender_id = str(getattr(agent, "_user_id", "") or "").strip()
     if not role:
         logger.info(
             "per-session OAuth: no role resolved for sender (%r) — fall back to static bearer",
@@ -664,7 +664,7 @@ def _resolve_per_session_mcp_config(agent) -> Optional[str]:
             )
 
     path = _write_per_session_mcp_config(
-        agent, token, bearers_path=bearers_path, sender_lid=sender_lid,
+        agent, token, bearers_path=bearers_path, sender_id=sender_id,
     )
     if not path:
         logger.warning(
@@ -1008,13 +1008,13 @@ def run_claude_code_cli_turn(
     if turn.final_text and not turn.interrupted and turn.error is None:
         try:
             from agent.block_e import run_gate as _block_e_run_gate
-            _sender_lid = str(getattr(agent, "_user_id", "") or "").strip()
+            _sender_id = str(getattr(agent, "_user_id", "") or "").strip()
             _role = _resolve_role_for_sender(agent)
             _agent_name = f"{_role}-agent" if _role else None
             _gated_text = _block_e_run_gate(
                 user_message=str(original_user_message or user_text or ""),
                 response_text=turn.final_text,
-                sender_lid=_sender_lid,
+                sender_id=_sender_id,
                 agent_name=_agent_name,
             )
             if isinstance(_gated_text, str) and _gated_text:
