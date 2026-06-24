@@ -552,6 +552,23 @@ def run_conversation(
     original_user_message = _ctx.original_user_message
     messages = _ctx.messages
     conversation_history = _ctx.conversation_history
+
+    # TEMP DIAG (2026-06-24): probe whether the wrap marker actually
+    # survived turn_context — checks the just-appended user message.
+    try:
+        for _diag_i in range(len(messages) - 1, -1, -1):
+            _diag_m = messages[_diag_i]
+            if isinstance(_diag_m, dict) and _diag_m.get("role") == "user":
+                _diag_c = _diag_m.get("content", "")
+                if isinstance(_diag_c, str):
+                    logger.warning(
+                        "POST-build_turn_context messages[%d] user content head: %r (current_turn_user_idx=%r, _ctx.user_message head=%r)",
+                        _diag_i, _diag_c[:220], _ctx.current_turn_user_idx,
+                        _ctx.user_message[:220] if isinstance(_ctx.user_message, str) else type(_ctx.user_message).__name__,
+                    )
+                break
+    except Exception as _e:
+        logger.warning("POST-build_turn_context diag failed: %s", _e)
     active_system_prompt = _ctx.active_system_prompt
     effective_task_id = _ctx.effective_task_id
     turn_id = _ctx.turn_id
