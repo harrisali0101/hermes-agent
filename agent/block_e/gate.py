@@ -201,6 +201,35 @@ def run_gate(
         )
         return response_text
 
+    # Intent-to-cite fallback (2026-06-25): if extract_citations returned
+    # nothing but the response clearly contains bracketed reference markers
+    # the bot tried to use as citations (anything in [...] that isn't a
+    # known UI false-positive and isn't pure digits), treat it as "the
+    # model tried to cite — extractor just didn't recognize the format".
+    # Pass through and log a warning. Better than nuking a real, substantive
+    # answer because a regex didn't match. The strict extractor still
+    # benefits from being broadened over time, but a citation-shape miss
+    # should never silently swallow the model's actual reply.
+    if not citations:
+        import re as _re
+        intent_re = _re.compile(r"\[([^\[\]\n]{6,200})\]")
+        from agent.block_e.citations import _FALSE_POSITIVES
+        for _m in intent_re.finditer(response_text):
+            _body = (_m.group(1) or "").strip()
+            if not _body:
+                continue
+            if _body.lower() in _FALSE_POSITIVES:
+                continue
+            if _body.replace("-", "").replace(" ", "").isdigit():
+                continue
+            logger.warning(
+                "block_e: PASS (citation-shape present but extractor "
+                "didn't parse it — broaden extract_citations) | sender=%s "
+                "agent=%s sample=%r",
+                sender_id, agent_name, _body[:120],
+            )
+            return response_text
+
     if not citations:
         logger.warning(
             "block_e: REFUSE (explicit brain invocation, no citation) "

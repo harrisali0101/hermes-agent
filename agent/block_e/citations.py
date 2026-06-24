@@ -43,11 +43,16 @@ _SLUG_CITATION_RE = re.compile(
 # date/version/time anchor inside the title text.
 _TITLE_CITATION_RE = re.compile(r"\[(?P<title>[^\[\]\n]{10,200})\]")
 _TITLE_ANCHOR_RE = re.compile(
-    # Month name (English short or long)
+    # Month name (English short or long), optionally followed by attached
+    # digits (`June26`, `Jun26`, `June2026`) or a space-separated day/year
+    # which the surrounding bullet usually carries anyway.
     r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?"
-    r"|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\b"
+    r"|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\b\d*"
     # ISO date YYYY-MM-DD
     r"|\b\d{4}-\d{2}-\d{2}\b"
+    # 4-digit year on its own (2000–2099 — covers any plausible doc/title
+    # year reference: `DIH Brief 2026`, `Q3 2026 Plan`, etc.)
+    r"|\b20\d{2}\b"
     # Version token (v9, v0.2.1, v2024-06)
     r"|\bv\d+(?:[\.\-]\d+)*\b"
     # Time HH:MM (with optional UTC/GMT/PKT/EST/PST/IST)
