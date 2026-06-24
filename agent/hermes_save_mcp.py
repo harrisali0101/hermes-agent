@@ -773,15 +773,18 @@ def _remove_super_admin_from_scopes_yaml(path: str, target_id: str) -> bool:
     return True
 
 
-def _lid_is_known(session_dir: str, lid: str) -> bool:
-    """True if WhatsApp has resolved this lid (a lid-mapping file exists) — i.e.
-    the lid came from a real contact/message, not a typo/guess. Guards
-    super_admin grants against fabricated lids."""
-    digits = lid.split("@", 1)[0]
-    for suffix in ("_reverse.json", ".json"):
-        if os.path.exists(os.path.join(session_dir, f"lid-mapping-{digits}{suffix}")):
-            return True
-    return False
+def _wa_id_is_known(wa_id: str) -> bool:
+    """True if the value looks like a verified WhatsApp Cloud wa_id (bare
+    digits, 8–15 chars). Post-2026-06-24 cutover, identity verification
+    is done by Meta's signed webhook before the value ever reaches us —
+    so any value that arrives via a ``<verified_sender>`` marker is
+    inherently real. The lingering Baileys-era ``_lid_is_known`` check
+    (which validated against `lid-mapping-<digits>.json` files in the
+    bridge session dir) is no longer applicable: those files don't
+    exist on WA Cloud sessions. Reduced to a shape check that guards
+    against operator typos / fabricated values."""
+    s = str(wa_id or "").strip()
+    return s.isdigit() and 8 <= len(s) <= 15
 
 
 def _count_super_admins(scopes_data: Dict[str, Any]) -> int:
@@ -864,46 +867,24 @@ def _remove_user_from_scopes_yaml(path: str, target_id: str) -> bool:
     return True
 
 
-def _phone_to_lid(session_dir: str, phone: str) -> Optional[str]:
-    """Resolve a phone → its WhatsApp wa_id via the bridge's reverse-mapping
-    files (`lid-mapping-<lid>_reverse.json` contains the phone). The lid is in
-    the filename. Returns `<digits>` or None."""
-    try:
-        for fn in os.listdir(session_dir):
-            if fn.startswith("lid-mapping-") and fn.endswith("_reverse.json"):
-                try:
-                    with open(os.path.join(session_dir, fn), "r", encoding="utf-8") as fh:
-                        if phone in fh.read():
-                            return fn[len("lid-mapping-"):-len("_reverse.json")]
-                except Exception:
-                    continue
-    except Exception:
-        return None
-    return None
+def _compute_pending(scopes_data: Dict[str, Any], env_path: str) -> List[Dict[str, Any]]:
+    """Allowlisted phones whose wa_id is NOT yet in scopes.yaml.
 
-
-def _compute_pending(scopes_data: Dict[str, Any], env_path: str, session_dir: str) -> List[Dict[str, Any]]:
-    """Allowlisted phones whose resolved lid is NOT yet in scopes.yaml.
     Independent of record_pending_user — surfaces a user even if the agent
-    never logged them. Returns [{phone, lid|None}]."""
+    never logged them. On WhatsApp Cloud the phone IS the wa_id (no @lid
+    suffix), so this is a direct set-comparison against scopes.yaml `id`
+    fields. Returns [{phone, wa_id}].
+    """
     phones, _memos = _read_allowlist(env_path)
-    known = _existing_lids(scopes_data)
+    known = _existing_lids(scopes_data)  # named for history; returns wa_ids post-cutover
     out: List[Dict[str, Any]] = []
     for ph in phones:
         if ph == "*":
             continue
-        lid_digits = _phone_to_lid(session_dir, ph)
-        lid = f"{lid_digits}@lid" if lid_digits else None
-        if lid and lid in known:
-            continue  # already onboarded
-        out.append({"phone": ph, "lid": lid})
+        if ph in known:
+            continue  # already onboarded as a wa_id-form identity
+        out.append({"phone": ph, "wa_id": ph})
     return out
-
-
-def _session_dir_for(env_path: str) -> str:
-    """The bridge's WhatsApp session dir (holds the lid mappings), derived
-    from the .env location: <…/.hermes>/whatsapp/session."""
-    return os.path.join(os.path.dirname(env_path) or ".", "whatsapp", "session")
 
 
 def _restart_gateway_detached() -> bool:
@@ -1155,12 +1136,11 @@ def _handle_list_pending_users(
     sender_id: str,
     pending_path: str,
     env_path: str,
-    session_dir: str,
 ) -> Dict[str, Any]:
     """Pending = the recorded queue UNION allowlisted numbers not yet in
-    scopes.yaml (computed, lid-resolved). The computed half is the robust fix:
-    it surfaces a user even if the agent never called record_pending_user.
-    Super_admin only."""
+    scopes.yaml (computed via wa_id set-compare against `id` fields).
+    The computed half is the robust fix: it surfaces a user even if the
+    agent never called record_pending_user. Super_admin only."""
     if not _is_super_admin(scopes_data, sender_id):
         _log("warn", "list_pending_users denied", sender=sender_id)
         return {
@@ -1170,7 +1150,7 @@ def _handle_list_pending_users(
             )}],
         }
     recorded = _load_pending(pending_path)
-    computed = _compute_pending(scopes_data, env_path, session_dir)
+    computed = _compute_pending(scopes_data, env_path)
 
     by_lid: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
@@ -1316,12 +1296,11 @@ def _handle_approve_user(
     sender_id: str,
     role: Optional[str],
     scopes_yaml_path: str,
-    session_dir: str,
 ) -> Dict[str, Any]:
     target_id = str(args.get("target_id") or "").strip()
     name = str(args.get("name") or "").strip()
     requested_role = str(args.get("role") or "").strip()
-    platform = str(args.get("platform") or "whatsapp").strip().lower() or "whatsapp"
+    platform = str(args.get("platform") or "whatsapp_cloud").strip().lower() or "whatsapp_cloud"
 
     # ── Authorization: only super_admins may onboard ───────────────────────
     if not _is_super_admin(scopes_data, sender_id):
@@ -1350,9 +1329,9 @@ def _handle_approve_user(
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
-                f"target_sender_id format invalid: '{target_id}'. Expected "
-                f"`<wa_id digits>` (the WhatsApp privacy-mode identifier). "
-                f"Capture the lid from the verified-sender marker on a "
+                f"target_id format invalid: '{target_id}'. Expected "
+                f"`<wa_id digits>` (8-15 bare digits, no `+`, no `@<suffix>`). "
+                f"Capture the wa_id from the verified-sender marker on a "
                 f"message the new user already sent."
             )}],
         }
@@ -1368,12 +1347,12 @@ def _handle_approve_user(
                 "every scope, runs on/off-boarding, and can mint other "
                 "super_admins. Re-issue with confirm_super_admin=true to proceed."
             )}]}
-        if not _lid_is_known(session_dir, target_id):
+        if not _wa_id_is_known(target_id):
             return {"isError": True, "content": [{"type": "text", "text": (
-                f"Won't grant super_admin to {target_id}: WhatsApp hasn't "
-                f"resolved this lid (no mapping on file), so it may be a typo "
-                f"or guess. Have them send one message first so the lid is "
-                f"verified, then retry."
+                f"Won't grant super_admin to {target_id}: that value doesn't "
+                f"look like a wa_id (bare digits, 8-15 chars). Capture the "
+                f"target's wa_id from a verified-sender marker on a message "
+                f"they sent, then retry."
             )}]}
         if _is_super_admin(scopes_data, target_id):
             return {"content": [{"type": "text", "text": (
@@ -1482,15 +1461,19 @@ def _handle_list_allowlist(
     scopes_data: Dict[str, Any],
     sender_id: str,
     env_path: str,
-    session_dir: str,
 ) -> Dict[str, Any]:
-    """Show the gateway allowlist with memo + onboarding status. Super_admin only."""
+    """Show the gateway allowlist with memo + onboarding status. Super_admin only.
+
+    Post-WhatsApp-Cloud-cutover the phone IS the wa_id (no @lid suffix), so
+    onboarding status is a direct set-compare between the allowlist phones
+    and the wa_ids registered in scopes.yaml.
+    """
     if not _is_super_admin(scopes_data, sender_id):
         return {"isError": True, "content": [{"type": "text", "text": (
             "The allowlist is restricted to super_admins."
         )}]}
     phones, memos = _read_allowlist(env_path)
-    known = _existing_lids(scopes_data)
+    known = _existing_lids(scopes_data)  # wa_ids post-cutover
     if not phones:
         return {"content": [{"type": "text", "text": "🔒 Allowlist is empty."}]}
     lines = ["🔒 %d number(s) on the allowlist:\n" % len(phones)]
@@ -1498,14 +1481,10 @@ def _handle_list_allowlist(
         if ph == "*":
             lines.append("- `*` — OPEN BOT (everyone allowed)")
             continue
-        lid_digits = _phone_to_lid(session_dir, ph)
-        lid = ("%s@lid" % lid_digits) if lid_digits else None
-        if lid and lid in known:
+        if ph in known:
             status = "✅ onboarded"
-        elif lid:
-            status = "⏳ messaged, no role yet"
         else:
-            status = "• not messaged yet"
+            status = "⏳ allowlisted, no role yet"
         line = "- `%s`" % ph
         if memos.get(ph):
             line += " — %s" % memos[ph]
@@ -1856,10 +1835,9 @@ def _handle_tools_call(
         }
     role = _resolve_role(scopes_data, sender_id)
 
-    session_dir = _session_dir_for(env_path)
     if name == "approve_user":
         return _handle_approve_user(
-            args, scopes_data, sender_id, role, scopes_yaml_path, session_dir,
+            args, scopes_data, sender_id, role, scopes_yaml_path,
         )
     if name == "add_to_allowlist":
         return _handle_add_to_allowlist(args, scopes_data, sender_id, env_path)
@@ -1867,10 +1845,10 @@ def _handle_tools_call(
         return _handle_record_pending_user(args, pending_path)
     if name == "list_pending_users":
         return _handle_list_pending_users(
-            scopes_data, sender_id, pending_path, env_path, session_dir,
+            scopes_data, sender_id, pending_path, env_path,
         )
     if name == "list_allowlist":
-        return _handle_list_allowlist(scopes_data, sender_id, env_path, session_dir)
+        return _handle_list_allowlist(scopes_data, sender_id, env_path)
     if name == "remove_from_allowlist":
         return _handle_remove_from_allowlist(args, scopes_data, sender_id, env_path)
     if name == "revoke_user":

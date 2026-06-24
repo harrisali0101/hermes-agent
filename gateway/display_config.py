@@ -53,6 +53,19 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # live, just cleaned up after success so the chat doesn't fill up with
     # stale breadcrumbs. Failed runs leave bubbles in place as breadcrumbs.
     "cleanup_progress": False,
+    # Operator-config overrides for the friendly tool-progress labels
+    # rendered by gateway/platforms/base.py via
+    # agent.display.get_tool_friendly_label(). Default is {} — falls
+    # through to the hardcoded DIH-flavored map in agent/display.py.
+    # Setting display.tool_labels in operator config.yaml lets the
+    # deployment rename labels without editing code. Shape:
+    # {"<raw_tool_name>": "<friendly label>"}.
+    "tool_labels": {},
+    # When True, the gateway shows just the basename of any path-shaped
+    # tool arg in chat tool-progress previews (drops the leading dirs
+    # so /datadrive/.../STATUS_QUERY.md previews as STATUS_QUERY.md).
+    # Off by default so upstream chrome assertions stay stable.
+    "trim_path_previews": False,
 }
 
 # ---------------------------------------------------------------------------
@@ -259,4 +272,15 @@ def _normalise(setting: str, value: Any) -> Any:
             return int(value)
         except (TypeError, ValueError):
             return 0
+    if setting == "tool_labels":
+        # Operator config supplies a {tool_name: friendly_label} mapping.
+        # Drop any non-string keys/values defensively — the consumer
+        # (agent.display.get_tool_friendly_label) only handles str→str.
+        if not isinstance(value, dict):
+            return {}
+        return {str(k): str(v) for k, v in value.items() if k and v}
+    if setting == "trim_path_previews":
+        if isinstance(value, str):
+            return value.lower() in {"true", "1", "yes", "on"}
+        return bool(value)
     return value

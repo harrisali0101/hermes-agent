@@ -218,35 +218,79 @@ _TOOL_FRIENDLY_LABELS: dict[str, str] = {
 }
 
 
+def _operator_user_config() -> dict:
+    """Lazy-load the parsed ~/.hermes/config.yaml dict.
+
+    Reuses gateway/run.py::_load_gateway_config (already mtime-cached
+    via hermes_cli.config.read_raw_config). Returns ``{}`` on any
+    import / read failure so callers can treat absence as "no
+    overrides set".
+    """
+    try:
+        from gateway.run import _load_gateway_config
+        cfg = _load_gateway_config()
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _operator_tool_labels() -> dict[str, str]:
+    """Pull display.tool_labels from operator config.yaml, if any.
+
+    Returns an empty dict (NOT a copy of the hardcoded map) when the
+    operator hasn't set anything — so callers can merge as overlay.
+    Any import / lookup failure returns ``{}`` quietly so the
+    in-code dict still drives behavior.
+    """
+    try:
+        from gateway.display_config import resolve_display_setting
+        val = resolve_display_setting(_operator_user_config(), "cli", "tool_labels")
+        return val if isinstance(val, dict) else {}
+    except Exception:
+        return {}
+
+
+def _operator_trim_path_previews() -> bool:
+    """Whether to apply path-basename trimming on previews (operator opt-in)."""
+    try:
+        from gateway.display_config import resolve_display_setting
+        return bool(resolve_display_setting(_operator_user_config(), "cli", "trim_path_previews"))
+    except Exception:
+        return False
+
+
 def get_tool_friendly_label(tool_name: str) -> str:
     """Return a CEO-friendly label for a tool name, or the raw tool name
     when no mapping exists.
 
+    Resolution order:
+      1. Operator config (``display.tool_labels`` in config.yaml) —
+         lets each deployment rename labels without code changes.
+      2. The hardcoded :data:`_TOOL_FRIENDLY_LABELS` map (DIH defaults).
+      3. The raw tool name (safe fallback).
+
     Used by gateway tool-progress rendering so chat users see
     ``"Searching the brain"`` instead of ``"mcp_gbrain_query"``.
-    The raw name is the safe fallback — a missing mapping degrades
-    to the previous display, not to an error.
     """
+    overrides = _operator_tool_labels()
+    if tool_name in overrides:
+        return overrides[tool_name]
     return _TOOL_FRIENDLY_LABELS.get(tool_name, tool_name)
 
 
 def format_friendly_preview(tool_name: str, raw_preview: str | None) -> str | None:
     """Tighten the per-call preview for non-technical display.
 
-    The gateway's default preview is the first ~40 chars of the primary
-    arg. For most tools that's fine (a query string, a page slug). For
-    file paths it leaks a full absolute path like
-    ``/datadrive/hermes/workspace/rules/STATUS_QUERY.md`` — keep just
-    the filename. The persona's narrator lines already describe the
-    intent in plain English; the preview only needs to disambiguate
-    between concurrent same-tool calls.
+    Path-basename trimming is opt-in via operator config
+    (``display.trim_path_previews: true``). When disabled, returns
+    ``raw_preview`` unchanged — matching upstream behavior and
+    chrome-assertion tests.
     """
     if not raw_preview:
         return raw_preview
-    # File-path tools: show just the basename, drop the absolute path noise.
+    if not _operator_trim_path_previews():
+        return raw_preview
     if tool_name in {"read_file", "write_file", "edit_file", "patch", "list_files"}:
-        # Path may have been pre-truncated with "..." — strip dirs only if
-        # we still have a real basename after the last "/".
         from pathlib import Path
         basename = Path(raw_preview).name
         return basename or raw_preview

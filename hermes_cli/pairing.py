@@ -39,13 +39,18 @@ def _cmd_list(store):
 
     if pending:
         print(f"\n  Pending Pairing Requests ({len(pending)}):")
-        print(f"  {'Platform':<12} {'Code':<10} {'User ID':<20} {'Name':<20} {'Age'}")
+        print(f"  {'Platform':<12} {'Hint':<10} {'User ID':<20} {'Name':<20} {'Age'}")
         print(f"  {'--------':<12} {'----':<10} {'-------':<20} {'----':<20} {'---'}")
         for p in pending:
             print(
-                f"  {p['platform']:<12} {p['code']:<10} {p['user_id']:<20} "
+                f"  {p['platform']:<12} {p['entry_hint']:<10} {p['user_id']:<20} "
                 f"{(p.get('user_name') or ''):<20} {p['age_minutes']}m ago"
             )
+        print(
+            "\n  NOTE: 'Hint' is a UI disambiguator (hash prefix), NOT a "
+            "code. To approve, use the actual code the user received in their "
+            "auto-reply (forward the message or have them resend)."
+        )
     else:
         print("\n  No pending pairing requests.")
 
