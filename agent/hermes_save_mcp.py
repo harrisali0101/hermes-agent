@@ -1885,7 +1885,15 @@ def _handle_send_template_message(
 
     access_token = os.environ.get("WHATSAPP_CLOUD_ACCESS_TOKEN", "").strip()
     phone_number_id = os.environ.get("WHATSAPP_CLOUD_PHONE_NUMBER_ID", "").strip()
-    api_version = os.environ.get("WHATSAPP_CLOUD_API_VERSION", "v20.0").strip() or "v20.0"
+    api_version = os.environ.get("WHATSAPP_CLOUD_API_VERSION", "v20.0").strip()
+    # Defense against the MCP-config ${VAR} passthrough leaking the literal
+    # placeholder string when the parent process doesn't have the var set —
+    # bit us at 2026-06-24 ~17:00 (Meta returned "Unknown path components"
+    # because the URL was https://graph.facebook.com/${WHATSAPP_CLOUD_API_VERSION}/.../messages).
+    # Any value containing `$` or `{` is not a real Graph version (e.g.
+    # `v20.0`, `v21.0`); fall back to the safe default.
+    if not api_version or "$" in api_version or "{" in api_version:
+        api_version = "v20.0"
 
     if not access_token or not phone_number_id:
         return {"isError": True, "content": [{"type": "text", "text": (
