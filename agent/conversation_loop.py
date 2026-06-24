@@ -815,6 +815,28 @@ def run_conversation(
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
+        # TEMP DIAGNOSTIC (2026-06-24): dump the last user message content
+        # to verify the <verified_sender> marker is present in what reaches
+        # the API. Remove once the missing-marker incident is root-caused.
+        try:
+            for _i in range(len(api_messages) - 1, -1, -1):
+                _m = api_messages[_i]
+                if isinstance(_m, dict) and _m.get("role") == "user":
+                    _c = _m.get("content", "")
+                    if isinstance(_c, str):
+                        logger.warning(
+                            "API user-msg head (first 220 chars): %r",
+                            _c[:220],
+                        )
+                    elif isinstance(_c, list):
+                        logger.warning(
+                            "API user-msg content-list types: %r",
+                            [type(_b).__name__ + ":" + str(_b.get("type") if isinstance(_b, dict) else "?") for _b in _c],
+                        )
+                    break
+        except Exception as _diag_err:
+            logger.warning("API user-msg diag failed: %s", _diag_err)
+
         # Inject ephemeral prefill messages right after the system prompt
         # but before conversation history. Same API-call-time-only pattern.
         if agent.prefill_messages:
