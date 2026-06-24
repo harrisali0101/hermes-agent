@@ -345,9 +345,9 @@ def finalize_turn(
     if final_response and not interrupted:
         try:
             from agent.block_e import run_gate as _block_e_run_gate
-            # Resolve sender lid + the OAuth client name from the same
+            # Resolve sender wa_id + the OAuth client name from the same
             # scopes.yaml helpers used by claude_code_runtime.
-            _sender_lid = str(getattr(agent, "_user_id", "") or "").strip()
+            _sender_id = str(getattr(agent, "_user_id", "") or "").strip()
             _agent_name = None
             try:
                 from agent.claude_code_runtime import _resolve_role_for_sender
@@ -360,7 +360,7 @@ def finalize_turn(
             _gated = _block_e_run_gate(
                 user_message=str(original_user_message or user_message or ""),
                 response_text=final_response,
-                sender_lid=_sender_lid,
+                sender_id=_sender_id,
                 agent_name=_agent_name,
             )
             if isinstance(_gated, str) and _gated:
