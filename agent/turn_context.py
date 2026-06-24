@@ -279,6 +279,22 @@ def build_turn_context(
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
+    # TEMP DIAG (2026-06-24): confirm the WRAPPED content is in messages
+    # at the just-appended index. If this prints the marker but the
+    # post-build_turn_context diag in conversation_loop sees unwrapped,
+    # something between here and the return overwrites it.
+    try:
+        _appended = messages[current_turn_user_idx].get("content", "")
+        if isinstance(_appended, str):
+            logger.warning(
+                "POST-append messages[%d] head: %r (user_message head: %r)",
+                current_turn_user_idx,
+                _appended[:220],
+                user_message[:220] if isinstance(user_message, str) else type(user_message).__name__,
+            )
+    except Exception:
+        pass
+
     if not agent.quiet_mode:
         _print_preview = summarize_user_message_for_log(user_message)
         agent._safe_print(
