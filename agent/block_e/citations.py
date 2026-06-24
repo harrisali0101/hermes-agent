@@ -15,8 +15,10 @@ Heuristics:
     listing unique slugs. The footer keeps the response readable for
     pilot users while preserving auditability.
 
-A more sophisticated v0.2 would look up titles via gbrain and render
-"q3-financials (finance) — Q3 Financials"; v0.1 just lists slugs.
+v0.2 (2026-06-24): footer now prettifies known slug shapes (``attach-…``,
+``email-…``, dated cohorts) into emoji-tagged human strings while keeping
+the canonical slug as the audit anchor. No gbrain round-trip — pure
+deterministic transforms — so it's safe to use on every turn.
 """
 
 from __future__ import annotations
@@ -84,17 +86,90 @@ def strip_inline_citations(text: str) -> str:
     return cleaned.strip()
 
 
+_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(.+)$")
+_HEX_TAIL_RE = re.compile(r"-[0-9a-f]{4,12}$")
+_VERSION_RE = re.compile(r"(?<![a-zA-Z])v(\d+)(?![a-zA-Z])")
+_NUMERIC_ID_RE = re.compile(r"^\d{6,}-\d{6,}(?:v\d+)?-")
+
+
+def prettify_slug(slug: str) -> str:
+    """Render a gbrain slug as a human-friendly string while keeping the
+    canonical slug retrievable. Pure deterministic — no gbrain calls.
+
+    Examples
+    --------
+    >>> prettify_slug("attach-2026-06-17-13861000-505035058v9-project-mesec-buyer-b322db")
+    '📎 2026-06-17 · project-mesec-buyer (v9)'
+    >>> prettify_slug("email-2026-06-24-mesec-facilities-agreement-issues-list-417b53")
+    '📧 2026-06-24 · mesec-facilities-agreement-issues-list'
+    >>> prettify_slug("q3-financials")
+    'q3-financials'
+    """
+    if not slug:
+        return slug
+    s = slug
+
+    # Detect kind prefix → emoji
+    emoji = ""
+    if s.startswith("attach-"):
+        emoji = "📎"
+        s = s[len("attach-"):]
+    elif s.startswith("email-"):
+        emoji = "📧"
+        s = s[len("email-"):]
+
+    # Pull out leading YYYY-MM-DD date if present
+    date_str = ""
+    m = _DATE_RE.match(s)
+    if m:
+        date_str = m.group(1)
+        s = m.group(2)
+
+    # Strip random hex hash tails (4-12 hex chars at end). Common in
+    # attach/email slugs as a short identifier.
+    s = _HEX_TAIL_RE.sub("", s)
+
+    # Strip leading numeric IDs like `13861000-505035058v9-` (mail-msg-id +
+    # version markers) — they're noise to the human reader.
+    version_match = _VERSION_RE.search(s)
+    version_suffix = f" (v{version_match.group(1)})" if version_match else ""
+    s = _NUMERIC_ID_RE.sub("", s)
+    # Also drop a bare trailing version token if it's at the end.
+    s = re.sub(r"-v\d+$", "", s)
+
+    # Compose
+    parts = []
+    if emoji:
+        parts.append(emoji)
+    if date_str:
+        parts.append(date_str + " ·")
+    if s:
+        parts.append(s + version_suffix)
+    return " ".join(parts).strip() or slug
+
+
 def format_references_footer(citations: List[Tuple[str, str]]) -> str:
     """Render the "Sources:" footer the bot appends after a passing turn.
-    Returns an empty string when there are no citations."""
+
+    Each entry shows the prettified slug followed by the canonical slug in
+    parens so the audit anchor stays intact. Returns an empty string when
+    there are no citations.
+
+    Example output (one citation):
+        Source: 📎 2026-06-17 · project-mesec-buyer (v9) [attach-2026-06-17-…-b322db]
+    """
     if not citations:
         return ""
     parts: List[str] = []
     for slug, section in citations:
-        if section:
-            parts.append(f"{slug} (§{section})")
+        pretty = prettify_slug(slug)
+        if pretty != slug:
+            entry = f"{pretty} [{slug}]"
         else:
-            parts.append(slug)
+            entry = slug
+        if section:
+            entry = f"{entry} (§{section})"
+        parts.append(entry)
     if len(parts) == 1:
         return f"Source: {parts[0]}"
-    return "Sources: " + ", ".join(parts)
+    return "Sources:\n  - " + "\n  - ".join(parts)
