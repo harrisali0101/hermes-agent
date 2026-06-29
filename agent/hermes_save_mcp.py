@@ -27,6 +27,18 @@ Env vars (read once at startup; no per-session env):
   HERMES_GBRAIN_TIMEOUT — optional, seconds, default 30
   HERMES_HERMES_ENV_PATH — optional, defaults to /home/hermes-user/.hermes/.env
   HERMES_PENDING_USERS_PATH — optional, defaults to the pilot path
+  HERMES_SAVE_BEARER_REFRESH_CMD — OPTIONAL. Absolute path to a script that
+                         prints a fresh access_token to stdout when invoked
+                         as `<cmd> <role>`. When set, the server tries to
+                         re-mint and retry once on a gbrain 401, instead of
+                         surfacing the error. Mirrors the upstream gateway
+                         fix (PR #52418). Static role-bearers.json tokens
+                         have a finite TTL (~1h on client_credentials grants);
+                         without this hook saves break the moment the file
+                         goes stale and require an external `fetch-secrets`
+                         re-run + service restart. Example value:
+                         `/etc/hermes/refresh-mcp-bearer.sh`. Strictly opt-in
+                         — unset → behavior identical to v0.2.
 
 Audit: every tool call writes one structured line to stderr so the parent
 shell (hermes.service journal) captures it. The `sender_id` from the
@@ -52,7 +64,19 @@ def _slugify(text: str, max_len: int = 80) -> str:
 
 _PROTOCOL_VERSION = "2024-11-05"
 _SERVER_NAME = "hermes-save"
-_SERVER_VERSION = "0.2.0"
+_SERVER_VERSION = "0.2.1"
+
+# Bearer auto-refresh on 401. Mirrors the gateway-side fix in PR #52418 but
+# adapted for this server's file-backed (not env-var) bearer model: on a 401
+# from gbrain put_page, invoke the operator-configured refresh command for
+# the writer_role, swap the in-memory bearer, atomically rewrite the
+# role-bearers.json entry, and retry the call ONCE. Static client_credentials
+# bearers have ~1h TTL; without this hook the next save after the file goes
+# stale fails until fetch-secrets re-runs (typically a full hermes restart).
+_BEARER_REFRESH_CMD_ENV = "HERMES_SAVE_BEARER_REFRESH_CMD"
+_BEARER_REFRESH_TIMEOUT_S = 10.0   # kill the mint command past this
+_BEARER_REFRESH_COOLDOWN_S = 60.0  # min seconds between refresh attempts per role
+_bearer_refresh_last_attempt: Dict[str, float] = {}
 
 # v0.2: every tool requires the verified sender's lid as a per-call arg
 # (no longer a process-startup env var). The persona MUST include this
@@ -113,6 +137,106 @@ def _load_bearers(path: str) -> Dict[str, str]:
     except Exception as exc:
         _log("error", "bearers file load failed", path=path, error=str(exc))
         return {}
+
+
+def _refresh_role_bearer(role: str, bearers_path: str) -> Optional[str]:
+    """Re-mint a fresh OAuth bearer for `role` via the operator-configured
+    refresh command. Returns the new bearer on success, or None when the
+    feature is disabled, cooldown is active, the command fails, or output
+    looks unhealthy. Also atomically rewrites the role's entry in
+    `bearers_path` so the next file reload sees the fresh token.
+
+    Discipline mirrors the upstream-gateway fix (PR #52418):
+      * 10s timeout kills slow mints.
+      * 60s cooldown per role prevents hammering on a stuck 401.
+      * Output validated — empty / <16 chars / whitespace-containing /
+        error-string-like outputs are rejected so a broken mint script
+        can't poison the bearer cache.
+      * One refresh attempt per call — caller is responsible for retry-once
+        semantics; this helper never loops.
+    """
+    import subprocess
+
+    cmd_path = _env(_BEARER_REFRESH_CMD_ENV)
+    if not cmd_path:
+        return None
+
+    now = time.time()
+    last = _bearer_refresh_last_attempt.get(role, 0.0)
+    if now - last < _BEARER_REFRESH_COOLDOWN_S:
+        _log(
+            "info", "bearer refresh skipped — cooldown active",
+            role=role,
+            seconds_remaining=round(_BEARER_REFRESH_COOLDOWN_S - (now - last), 1),
+        )
+        return None
+    _bearer_refresh_last_attempt[role] = now
+
+    try:
+        proc = subprocess.run(
+            [cmd_path, role],
+            capture_output=True, text=True,
+            timeout=_BEARER_REFRESH_TIMEOUT_S, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        _log(
+            "error", "bearer refresh timed out",
+            role=role, timeout_s=_BEARER_REFRESH_TIMEOUT_S,
+        )
+        return None
+    except FileNotFoundError:
+        _log("error", "bearer refresh cmd not found", role=role, cmd=cmd_path)
+        return None
+    except Exception as exc:
+        _log("error", "bearer refresh spawn failed", role=role, error=str(exc))
+        return None
+
+    if proc.returncode != 0:
+        _log(
+            "error", "bearer refresh non-zero exit",
+            role=role, code=proc.returncode,
+            stderr_snippet=(proc.stderr or "")[:200],
+        )
+        return None
+
+    new_bearer = (proc.stdout or "").strip()
+    if not new_bearer or len(new_bearer) < 16 or any(c.isspace() for c in new_bearer):
+        _log(
+            "error", "bearer refresh output rejected (empty/short/whitespace)",
+            role=role, len=len(new_bearer),
+        )
+        return None
+    lower = new_bearer.lower()
+    if any(needle in lower for needle in ("error", "failed", "<html", '"error"', "{")):
+        _log(
+            "error", "bearer refresh output rejected (looks like an error string)",
+            role=role,
+        )
+        return None
+
+    # Persist to file: atomic tmp + rename. Failure here is non-fatal —
+    # we still return the fresh bearer for the caller's immediate retry;
+    # the in-memory copy carries it through this call even if disk write
+    # is briefly unavailable. The next call will re-read the (now-fresh)
+    # file on the normal _load_bearers path.
+    if bearers_path:
+        try:
+            current = _load_bearers(bearers_path)
+            current[role] = new_bearer
+            tmp_path = bearers_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(current, fh)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, bearers_path)
+        except Exception as exc:
+            _log(
+                "warn",
+                "bearer refresh disk-write failed (returning bearer anyway)",
+                role=role, error=str(exc),
+            )
+
+    _log("info", "bearer refreshed", role=role)
+    return new_bearer
 
 
 def _resolve_role(scopes_data: Dict[str, Any], sender_id: str) -> Optional[str]:
@@ -1452,14 +1576,23 @@ def _handle_approve_user(
             )}],
         }
 
-    if platform not in {"whatsapp"}:
+    # Accept both Baileys-era and Cloud-API platform names. The underlying
+    # identity is the wa_id (Meta-side, platform-agnostic), so a single
+    # scopes.yaml entry serves both transports. We normalise the stored
+    # value to "whatsapp" right after the check so scopes.yaml stays
+    # uniform — every existing entry uses `platform: whatsapp` and mixing
+    # in `platform: whatsapp_cloud` would fragment the field for no gain.
+    if platform not in {"whatsapp", "whatsapp_cloud"}:
         return {
             "isError": True,
             "content": [{"type": "text", "text": (
-                f"platform '{platform}' not supported yet (only 'whatsapp'). "
-                f"Future Teams/SMS support will land in Phase 8."
+                f"platform '{platform}' not supported yet (whatsapp / "
+                f"whatsapp_cloud only). Future Teams/SMS support will "
+                f"land in Phase 8."
             )}],
         }
+    if platform == "whatsapp_cloud":
+        platform = "whatsapp"
 
     # ── Idempotency: don't double-add ──────────────────────────────────────
     existing = _existing_lids(scopes_data)
@@ -1986,6 +2119,7 @@ def _handle_tools_call(
     scopes_yaml_path: str,
     env_path: str,
     pending_path: str,
+    bearers_path: str = "",
 ) -> Dict[str, Any]:
     params = req.get("params") or {}
     name = str(params.get("name") or "")
@@ -2161,28 +2295,46 @@ def _handle_tools_call(
         slug=slug,
         body_len=len(body),
     )
-    try:
-        result = _gbrain_put_page(gbrain_url, bearer, title, body, slug, timeout)
-    except urllib.error.HTTPError as exc:
-        snippet = ""
+    # Single attempt with optional one-shot bearer refresh on 401. When
+    # HERMES_SAVE_BEARER_REFRESH_CMD is unset, _refresh_role_bearer returns
+    # None and behavior matches v0.2 exactly (just log + surface the error).
+    auth_retried = False
+    while True:
         try:
-            snippet = exc.read().decode("utf-8", errors="replace")[:300]
-        except Exception:
-            pass
-        _log("error", "gbrain HTTPError", code=exc.code, snippet=snippet)
-        return {
-            "isError": True,
-            "content": [{
-                "type": "text",
-                "text": f"gbrain put_page HTTP {exc.code}: {snippet}",
-            }],
-        }
-    except Exception as exc:
-        _log("error", "gbrain request failed", error=str(exc))
-        return {
-            "isError": True,
-            "content": [{"type": "text", "text": f"gbrain request failed: {exc}"}],
-        }
+            result = _gbrain_put_page(gbrain_url, bearer, title, body, slug, timeout)
+            break
+        except urllib.error.HTTPError as exc:
+            snippet = ""
+            try:
+                snippet = exc.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                pass
+            if exc.code == 401 and not auth_retried:
+                _log(
+                    "warn", "gbrain put_page 401 — attempting bearer refresh",
+                    sender=sender_id, role=role, writer_role=writer_role,
+                    snippet=snippet,
+                )
+                new_bearer = _refresh_role_bearer(writer_role, bearers_path)
+                if new_bearer:
+                    bearer = new_bearer
+                    bearers[writer_role] = new_bearer
+                    auth_retried = True
+                    continue
+            _log("error", "gbrain HTTPError", code=exc.code, snippet=snippet)
+            return {
+                "isError": True,
+                "content": [{
+                    "type": "text",
+                    "text": f"gbrain put_page HTTP {exc.code}: {snippet}",
+                }],
+            }
+        except Exception as exc:
+            _log("error", "gbrain request failed", error=str(exc))
+            return {
+                "isError": True,
+                "content": [{"type": "text", "text": f"gbrain request failed: {exc}"}],
+            }
 
     # Pass through gbrain's tool result if present; otherwise return the raw envelope
     inner = (result or {}).get("result")
@@ -2306,7 +2458,7 @@ def main() -> int:
                     _handle_tools_call(
                         req, scopes_data, bearers,
                         gbrain_url, timeout, scopes_yaml_path, env_path,
-                        pending_path,
+                        pending_path, bearers_path,
                     ),
                 )
             elif method == "ping":
