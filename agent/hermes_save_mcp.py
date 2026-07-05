@@ -326,6 +326,227 @@ def _gbrain_put_page(
     return _parse_sse_envelope(raw)
 
 
+# ─── Document upload guardrails (save_document_to_scope) ────────────────
+# The document tool is called with a server-side path (typically the
+# WhatsApp Cloud webhook's media cache entry), so path traversal +
+# symlink escape + oversized-file DoS need to be handled here. Mime is
+# allowlisted so the ingest pipeline (Track B) never has to guess.
+
+_MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB — matches WhatsApp's Cloud API
+                                       # media size cap; larger files need a
+                                       # different pipeline (chunked upload
+                                       # via SharePoint), not this MVP.
+
+_ALLOWED_MIMES: frozenset = frozenset({
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
+    "text/plain",
+    "text/csv",
+    "text/markdown",
+    "image/jpeg",
+    "image/png",
+    "image/tiff",
+    "image/heic",
+})
+
+# Extension → mime for inference when the caller omits mime_type. Kept
+# tight to the same set the allowlist accepts; anything not in this map
+# falls through to `unsupported_mime` at the allowlist check.
+_EXT_TO_MIME: Dict[str, str] = {
+    ".pdf": "application/pdf",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".heic": "image/heic",
+}
+
+
+def _allowed_upload_roots() -> List[str]:
+    """Real paths of directories that may hold a save_document_to_scope
+    source file. Any `local_path` must resolve (post-realpath) to somewhere
+    under one of these. Values are `realpath`d so symlink comparisons are
+    honest — otherwise a rogue symlink outside the root but pointing in
+    would look valid.
+    """
+    candidates = [
+        os.path.expanduser("~/.hermes/platforms"),
+        "/tmp",
+    ]
+    roots: List[str] = []
+    for c in candidates:
+        try:
+            roots.append(os.path.realpath(c))
+        except Exception:
+            continue
+    return roots
+
+
+def _validate_upload_path(local_path: str) -> Optional[str]:
+    """Return None if `local_path` is safe to open for a scoped ingest,
+    otherwise a short error string suitable for the tool result.
+
+    Guarded against:
+      * empty / `..` components (classic traversal),
+      * ANY symlink between the file and filesystem root (so a hostile
+        symlink dropped inside the allowed root can't redirect us to
+        /etc/shadow or similar),
+      * paths that resolve outside `~/.hermes/platforms/*/media/` or
+        `/tmp/`,
+      * non-existent / non-regular / non-readable files.
+
+    All negative cases are returned as strings; caller renders them in
+    the tool envelope.
+    """
+    if not local_path:
+        return "local_path is empty"
+    norm = local_path.replace("\\", "/")
+    if any(p == ".." for p in norm.split("/")):
+        return "local_path contains '..'"
+
+    abs_path = os.path.abspath(local_path)
+
+    # Walk the path from the file up to root, checking each component
+    # for a symlink. This catches BOTH a symlink at the leaf AND a
+    # symlinked parent directory that would otherwise let a resolved
+    # `real_path` land inside the allowed root while the pre-resolve
+    # component pointed elsewhere.
+    walk = abs_path
+    while True:
+        try:
+            if os.path.islink(walk):
+                return f"symlink in path: {walk}"
+        except OSError:
+            break
+        parent = os.path.dirname(walk)
+        if parent == walk:
+            break
+        walk = parent
+
+    try:
+        real = os.path.realpath(abs_path)
+    except Exception as exc:
+        return f"realpath failed: {exc}"
+
+    roots = _allowed_upload_roots()
+    if not any(real == r or real.startswith(r + os.sep) for r in roots):
+        return (
+            "local_path resolves outside allowed roots (must live under "
+            "~/.hermes/platforms/*/media/ or /tmp/)"
+        )
+
+    if not os.path.exists(real):
+        return "file does not exist"
+    if not os.path.isfile(real):
+        return "path is not a regular file"
+    if not os.access(real, os.R_OK):
+        return "file is not readable"
+    return None
+
+
+def _sha256_file(path: str) -> str:
+    """SHA-256 hex digest of `path`, streamed in 1 MB chunks so a 20 MB
+    PDF doesn't buffer entirely in memory before the hash is emitted."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            buf = fh.read(1024 * 1024)
+            if not buf:
+                break
+            h.update(buf)
+    return h.hexdigest()
+
+
+def _infer_mime_from_extension(local_path: str) -> Optional[str]:
+    ext = os.path.splitext(local_path)[1].lower()
+    return _EXT_TO_MIME.get(ext)
+
+
+def _gbrain_find_page_by_content_hash(
+    gbrain_url: str,
+    bearer: str,
+    source_id: str,
+    content_hash: str,
+    timeout: float,
+) -> Optional[str]:
+    """Best-effort dedup pre-check: ask gbrain whether a page with this
+    content_hash already exists in `source_id`. Returns the existing slug
+    on hit, None on miss OR on ANY error (network, unknown-method, malformed
+    envelope, RLS refusal — the caller falls through to the ingest path
+    which is itself idempotent on content_hash, so a false negative here
+    only costs latency, never correctness).
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "find_page_by_content_hash",
+            "arguments": {
+                "source_id": source_id,
+                "content_hash": content_hash,
+            },
+        },
+    }
+    try:
+        req = urllib.request.Request(
+            f"{gbrain_url.rstrip('/')}/mcp",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {bearer}",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+        envelope = _parse_sse_envelope(raw)
+    except Exception:
+        return None
+
+    result = (envelope or {}).get("result") or {}
+    if not isinstance(result, dict):
+        return None
+    # Accept either a top-level `slug` or a stringified JSON payload inside
+    # content[0].text — gbrain tools historically use both shapes.
+    slug = result.get("slug")
+    if isinstance(slug, str) and slug:
+        return slug
+    content = result.get("content") or []
+    if isinstance(content, list) and content:
+        first = content[0]
+        if isinstance(first, dict):
+            text = first.get("text")
+            if isinstance(text, str):
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    return None
+                if isinstance(parsed, dict):
+                    slug2 = parsed.get("slug")
+                    if isinstance(slug2, str) and slug2:
+                        return slug2
+    return None
+
+
 # ─── MCP protocol handlers ───────────────────────────────────────────────
 
 
@@ -387,6 +608,73 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                         },
                     },
                     "required": ["sender_id", "scope", "title", "body"],
+                },
+            },
+            {
+                "name": "save_document_to_scope",
+                "description": (
+                    "Persist an inbound document (from WhatsApp media, "
+                    "SharePoint, etc.) as a scoped gbrain page. Runs OCR "
+                    "(for scans/images) → chunks → embeds → upserts to "
+                    "gbrain. Idempotent on content-hash: re-saving the "
+                    "same file returns the existing slug. RLS-enforced: "
+                    "sender must have write access to the target scope "
+                    "per scopes.yaml roles.<role>.writes. Available "
+                    "scopes: " + ", ".join(available_scopes) + ". Response "
+                    "is JSON in content[0].text with status "
+                    "'created_or_updated' or 'already_saved' on success."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sender_id": _SENDER_LID_SCHEMA,
+                        "scope": {
+                            "type": "string",
+                            "enum": available_scopes,
+                            "description": (
+                                "Target scope. Must be one of the allowed "
+                                "enum values; the sender's role must also "
+                                "have write permission for it (same check "
+                                "as save_to_scope)."
+                            ),
+                        },
+                        "local_path": {
+                            "type": "string",
+                            "description": (
+                                "Server-side path to the file, typically "
+                                "`~/.hermes/platforms/whatsapp_cloud/"
+                                "media/<media_id>.<ext>` from the inbound "
+                                "media cache, or a staged path under "
+                                "`/tmp/`. Paths outside those roots, paths "
+                                "containing `..`, and paths that traverse "
+                                "a symlink are refused."
+                            ),
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": (
+                                "Human-readable title for the saved page. "
+                                "Infer from the user's message and the "
+                                "file's own metadata; used verbatim as the "
+                                "page heading and as one of the inputs to "
+                                "the derived slug."
+                            ),
+                        },
+                        "mime_type": {
+                            "type": "string",
+                            "description": (
+                                "MIME type of the file (e.g. "
+                                "`application/pdf`, `image/jpeg`). Optional "
+                                "— if omitted, the server infers it from "
+                                "the file extension. Only PDF, Office "
+                                "(doc/docx/xls/xlsx/ppt/pptx), text/CSV/"
+                                "Markdown, and JPEG/PNG/TIFF/HEIC are "
+                                "accepted; other types return "
+                                "`unsupported_mime`."
+                            ),
+                        },
+                    },
+                    "required": ["sender_id", "scope", "local_path", "title"],
                 },
             },
             {
@@ -2110,6 +2398,266 @@ def _handle_send_template_message(
     )}]}
 
 
+def _handle_save_document_to_scope(
+    args: Dict[str, Any],
+    scopes_data: Dict[str, Any],
+    bearers: Dict[str, str],
+    sender_id: str,
+    role: Optional[str],
+    gbrain_url: str,
+    timeout: float,
+) -> Dict[str, Any]:
+    """Ingest an inbound document into a scoped gbrain page.
+
+    Auth flow mirrors `save_to_scope`: sender_id is already validated
+    by the outer dispatcher, `role` is resolved from scopes.yaml here,
+    and the target scope is gated by `_can_write` (super_admin bypass
+    via `_can_write` too). Additional document-only safety:
+      * `_validate_upload_path` blocks traversal + symlink escape,
+      * MIME allowlist blocks arbitrary/executable types,
+      * 20 MB cap blocks resource-exhaustion via oversized attachments,
+      * SHA-256 pre-check lets us short-circuit an already-saved file
+        without invoking the (heavier) ingest pipeline.
+
+    Response is JSON in content[0].text so both the agent and the
+    audit log see a stable machine-parseable shape. Never raises — every
+    exit returns an MCP envelope.
+    """
+    scope = str(args.get("scope") or "").strip()
+    local_path = str(args.get("local_path") or "").strip()
+    title = str(args.get("title") or "").strip()
+    mime_type = args.get("mime_type")
+    if mime_type is not None:
+        mime_type = str(mime_type).strip() or None
+
+    def _reply(is_error: bool, payload: Dict[str, Any]) -> Dict[str, Any]:
+        env: Dict[str, Any] = {
+            "content": [{
+                "type": "text",
+                "text": json.dumps(payload, ensure_ascii=False),
+            }],
+        }
+        if is_error:
+            env["isError"] = True
+        return env
+
+    # ── Basic input validation ─────────────────────────────────────────
+    if not scope:
+        return _reply(True, {"status": "error", "reason": "missing_scope"})
+    if not local_path:
+        return _reply(True, {"status": "error", "reason": "missing_local_path"})
+    if not title:
+        return _reply(True, {"status": "error", "reason": "missing_title"})
+
+    available = set(_scope_list(scopes_data))
+    if scope not in available:
+        return _reply(True, {
+            "status": "error",
+            "reason": "unknown_scope",
+            "scope": scope,
+            "available": sorted(available),
+        })
+
+    # ── Role + write authorization (mirrors save_to_scope) ─────────────
+    if not role:
+        _log(
+            "warn", "save_document_to_scope: no role resolved for sender",
+            sender=sender_id, scope=scope,
+        )
+        return _reply(True, {
+            "status": "error", "reason": "sender_not_roled",
+        })
+    if not _can_write(scopes_data, role, scope):
+        _log(
+            "warn", "save_document_to_scope: role not authorized for scope",
+            sender=sender_id, role=role, scope=scope,
+        )
+        role_def = (scopes_data.get("roles") or {}).get(role) or {}
+        return _reply(True, {
+            "status": "error",
+            "reason": "unauthorized_scope",
+            "role": role,
+            "scope": scope,
+            "allowed_writes": sorted(role_def.get("writes") or []),
+        })
+
+    # ── Path safety guard ──────────────────────────────────────────────
+    path_err = _validate_upload_path(local_path)
+    if path_err:
+        _log(
+            "warn", "save_document_to_scope: path rejected",
+            sender=sender_id, local_path=local_path, reason=path_err,
+        )
+        return _reply(True, {
+            "status": "error",
+            "reason": "invalid_path",
+            "detail": path_err,
+        })
+    real_path = os.path.realpath(local_path)
+
+    # ── Size cap (fail-closed before we hash or ingest) ────────────────
+    try:
+        size_bytes = os.path.getsize(real_path)
+    except OSError as exc:
+        _log(
+            "warn", "save_document_to_scope: stat failed",
+            sender=sender_id, local_path=real_path, error=str(exc),
+        )
+        return _reply(True, {
+            "status": "error", "reason": "stat_failed", "detail": str(exc),
+        })
+    if size_bytes > _MAX_UPLOAD_BYTES:
+        _log(
+            "warn", "save_document_to_scope: file too large",
+            sender=sender_id, size_bytes=size_bytes, cap=_MAX_UPLOAD_BYTES,
+        )
+        return _reply(True, {
+            "status": "error",
+            "reason": "file_too_large",
+            "size_bytes": size_bytes,
+            "cap_bytes": _MAX_UPLOAD_BYTES,
+        })
+
+    # ── Mime allowlist ─────────────────────────────────────────────────
+    if not mime_type:
+        mime_type = _infer_mime_from_extension(real_path)
+    if not mime_type or mime_type not in _ALLOWED_MIMES:
+        _log(
+            "warn", "save_document_to_scope: unsupported mime",
+            sender=sender_id, mime_type=mime_type or "(unknown)",
+        )
+        return _reply(True, {
+            "status": "error",
+            "reason": "unsupported_mime",
+            "mime_type": mime_type,
+            "allowed": sorted(_ALLOWED_MIMES),
+        })
+
+    # ── SHA-256 the file ───────────────────────────────────────────────
+    try:
+        content_hash = _sha256_file(real_path)
+    except OSError as exc:
+        _log(
+            "error", "save_document_to_scope: hash read failed",
+            sender=sender_id, local_path=real_path, error=str(exc),
+        )
+        return _reply(True, {
+            "status": "error", "reason": "read_failed", "detail": str(exc),
+        })
+
+    # ── Writer bearer for target scope (drives dedup pre-check) ────────
+    scope_def = (scopes_data.get("scopes") or {}).get(scope) or {}
+    writer_role = str(scope_def.get("writer_role") or "").strip()
+    if not writer_role:
+        return _reply(True, {
+            "status": "error",
+            "reason": "scope_missing_writer_role",
+            "scope": scope,
+        })
+    writer_bearer = bearers.get(writer_role) or ""
+    # Missing bearer isn't fatal here — the ingest helper (Track B)
+    # authenticates on its own; we just skip the fast-path dedup and
+    # let the helper's own content_hash idempotency handle it.
+
+    # ── Content-hash pre-check (fast-path dedup) ───────────────────────
+    if writer_bearer:
+        existing_slug = _gbrain_find_page_by_content_hash(
+            gbrain_url, writer_bearer, scope, content_hash, timeout,
+        )
+        if existing_slug:
+            _log(
+                "info", "save_document_to_scope: dedup hit (pre-check)",
+                sender=sender_id, scope=scope,
+                slug=existing_slug, content_hash=content_hash,
+            )
+            return _reply(False, {
+                "status": "already_saved",
+                "slug": existing_slug,
+                "content_hash": content_hash,
+                "scope": scope,
+            })
+
+    # ── Slug derivation ────────────────────────────────────────────────
+    ts = time.strftime("%Y-%m-%d", time.gmtime())
+    derived_slug = (
+        f"upload-{ts}-{_slugify(scope)}-{_slugify(title)}-{content_hash[:8]}"
+    )
+
+    # ── Dispatch to the Track B ingestion helper ───────────────────────
+    # Kept as a late import so an operator can restart hermes with the new
+    # tool schema BEFORE Track B has landed on the box — the tool then
+    # fails cleanly with `ingest_helper_unavailable` instead of preventing
+    # server startup.
+    try:
+        from gbrain_ingest_document import (  # type: ignore
+            gbrain_ingest_document,
+            IngestResult,  # noqa: F401 — re-exported for Track B contract clarity
+        )
+    except Exception as exc:
+        _log(
+            "error", "save_document_to_scope: ingest helper import failed",
+            error=str(exc),
+        )
+        return _reply(True, {
+            "status": "error",
+            "reason": "ingest_helper_unavailable",
+            "detail": str(exc),
+        })
+
+    _log(
+        "info", "save_document_to_scope dispatch",
+        sender=sender_id, role=role, scope=scope, slug=derived_slug,
+        size_bytes=size_bytes, mime_type=mime_type,
+        content_hash=content_hash,
+    )
+
+    try:
+        result = gbrain_ingest_document(
+            local_path=real_path,
+            source_id=scope,
+            slug=derived_slug,
+            title=title,
+            mime_type=mime_type,
+        )
+    except Exception as exc:
+        _log(
+            "error", "save_document_to_scope: ingest raised",
+            sender=sender_id, scope=scope, slug=derived_slug, error=str(exc),
+        )
+        return _reply(True, {
+            "status": "error",
+            "reason": "ingest_failed",
+            "detail": str(exc),
+        })
+
+    # IngestResult contract (Track B):
+    #   result.slug          — str, final slug (may differ from derived)
+    #   result.page_id       — str, gbrain page id
+    #   result.content_hash  — str, hex sha256 stored on the page
+    #   result.was_duplicate — bool, True when hash matched existing page
+    #   result.warnings      — list[str], non-fatal notices (OCR fallbacks…)
+    slug_out = getattr(result, "slug", None) or derived_slug
+    page_id = getattr(result, "page_id", None)
+    hash_out = getattr(result, "content_hash", None) or content_hash
+    warnings = list(getattr(result, "warnings", None) or [])
+    was_duplicate = bool(getattr(result, "was_duplicate", False))
+
+    status = "already_saved" if was_duplicate else "created_or_updated"
+    _log(
+        "info", "save_document_to_scope success",
+        sender=sender_id, scope=scope, slug=slug_out,
+        page_id=page_id, status=status, warnings=len(warnings),
+    )
+    return _reply(False, {
+        "status": status,
+        "slug": slug_out,
+        "page_id": page_id,
+        "content_hash": hash_out,
+        "scope": scope,
+        "warnings": warnings,
+    })
+
+
 def _handle_tools_call(
     req: Dict[str, Any],
     scopes_data: Dict[str, Any],
@@ -2179,6 +2727,10 @@ def _handle_tools_call(
         return _handle_reload_gateway(scopes_data, sender_id)
     if name == "send_template_message":
         return _handle_send_template_message(args, scopes_data, sender_id)
+    if name == "save_document_to_scope":
+        return _handle_save_document_to_scope(
+            args, scopes_data, bearers, sender_id, role, gbrain_url, timeout,
+        )
     if name != "save_to_scope":
         return {
             "isError": True,
