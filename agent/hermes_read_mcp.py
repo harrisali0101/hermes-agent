@@ -96,13 +96,23 @@ _READ_TOOLS = ("query", "search", "get_page", "list_pages", "status_sweep")
 
 # ── status_sweep helpers — content-date extraction + anchor pick ─────────
 
-# Structured-doc title fingerprint. Matches the anchor pattern from
-# STATUS_QUERY.md: checklist / dashboard / status / tracker / summary /
-# memo / register (added 2026-07-05 for the CEO obligations register
-# shape). Case-insensitive, word-boundaried so "status" doesn't match
-# "statusquo".
+# Structured-doc title fingerprint — LIVE STATUS SNAPSHOTS only.
+# Matches the anchor pattern from STATUS_QUERY.md: recurring, dated
+# operational docs that summarize project state at a point in time.
+#
+# Excluded on purpose (2026-07-05 tune after WA E2E):
+#   - `register` and `memo` — these are one-off compiled notes, not live
+#     status snapshots. Including them let a `ceo-obligations-register-*`
+#     page beat the actual `Buyer Internal Closing Checklist` as anchor.
+#     The persona model correctly overrode this ("The July-5 CEO
+#     obligations register is a compiled note, not a live status
+#     snapshot. The real closing-status anchor is the 30 June Buyer
+#     Internal Closing Checklist"), but the tool should produce the
+#     right answer by default.
+#
+# Case-insensitive, word-boundaried so "status" doesn't match "statusquo".
 _ANCHOR_TITLE_RE = re.compile(
-    r"\b(checklist|dashboard|status|tracker|summary|memo|register|briefing)\b",
+    r"\b(checklist|dashboard|status|tracker|summary|briefing)\b",
     re.IGNORECASE,
 )
 
