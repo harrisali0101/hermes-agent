@@ -88,7 +88,400 @@ _SENDER_LID_SCHEMA: Dict[str, Any] = {
 
 # These are the gbrain MCP tool names we proxy. Names match gbrain's
 # exposed tools verbatim so the model's mental mapping stays simple.
-_READ_TOOLS = ("query", "search", "get_page", "list_pages")
+# status_sweep is HERMES-side composite (not a gbrain tool) — it
+# orchestrates query + get_page + sort into one atomic sweep so the
+# model can't skip discovery steps on status questions.
+_READ_TOOLS = ("query", "search", "get_page", "list_pages", "status_sweep")
+
+
+# ── status_sweep helpers — content-date extraction + anchor pick ─────────
+
+# Structured-doc title fingerprint. Matches the anchor pattern from
+# STATUS_QUERY.md: checklist / dashboard / status / tracker / summary /
+# memo / register (added 2026-07-05 for the CEO obligations register
+# shape). Case-insensitive, word-boundaried so "status" doesn't match
+# "statusquo".
+_ANCHOR_TITLE_RE = re.compile(
+    r"\b(checklist|dashboard|status|tracker|summary|memo|register|briefing)\b",
+    re.IGNORECASE,
+)
+
+
+def _content_date(page: Any) -> Optional[str]:
+    """Extract the best content-date signal from a gbrain page dict.
+
+    Fallback chain (STATUS_QUERY.md §4 discipline):
+      1. frontmatter.date        — the AUTHORED date (email send, doc write)
+      2. frontmatter.sent_at     — older email-record shape
+      3. effective_date          — gbrain-computed top-level date signal
+      4. frontmatter.captured_at — when the ingest captured it
+      5. created_at              — first-ingest timestamp
+      6. updated_at              — LAST-RESORT re-ingest timestamp (a stale
+                                    email re-ingested today looks "newest"
+                                    by updated_at — do NOT use this alone)
+
+    Returns an ISO-8601 string or None. String comparison is safe on
+    ISO-8601 (`2026-07-05T...` > `2026-06-30T...` lexically).
+    """
+    if not isinstance(page, dict):
+        return None
+    fm = page.get("frontmatter") if isinstance(page.get("frontmatter"), dict) else {}
+    candidates = (
+        fm.get("date"),
+        fm.get("sent_at"),
+        page.get("effective_date"),
+        fm.get("captured_at"),
+        page.get("created_at"),
+        page.get("updated_at"),
+    )
+    for c in candidates:
+        if c:
+            return str(c)
+    return None
+
+
+def _pick_anchor(pages: list) -> Optional[Dict[str, Any]]:
+    """From an enriched page list, pick the anchor: newest structured doc
+    whose title matches _ANCHOR_TITLE_RE. Fallback: newest by content_date.
+    Returns None on empty input."""
+    if not pages:
+        return None
+    matches = [p for p in pages if isinstance(p, dict) and _ANCHOR_TITLE_RE.search(str(p.get("title") or ""))]
+    if matches:
+        matches.sort(key=lambda p: _content_date(p) or "", reverse=True)
+        return matches[0]
+    sorted_all = sorted(pages, key=lambda p: _content_date(p) or "", reverse=True)
+    return sorted_all[0] if sorted_all else None
+
+
+def _shape_page_for_envelope(page: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact page shape for the status_sweep return envelope. Keeps
+    body + metadata the model needs to compose an answer with citations;
+    drops server-internal noise (content_hash, source_uri, ingested_at,
+    timeline)."""
+    if not isinstance(page, dict):
+        return {}
+    return {
+        "slug": page.get("slug"),
+        "title": page.get("title"),
+        "type": page.get("type"),
+        "content_date": _content_date(page),
+        "source_id": page.get("source_id"),
+        "body": page.get("compiled_truth") or page.get("body") or "",
+        "tags": page.get("tags") or [],
+    }
+
+
+def _extract_gbrain_content(result: Any) -> Any:
+    """Given gbrain's raw JSON-RPC result envelope, return the parsed
+    inner content or None. gbrain always wraps the payload as
+    ``{result: {content: [{type: 'text', text: '<json-string>'}]}}``.
+    Failure modes handled: missing keys, isError set, non-JSON text.
+    """
+    if not isinstance(result, dict):
+        return None
+    inner = result.get("result")
+    if not isinstance(inner, dict):
+        return None
+    if inner.get("isError"):
+        return None
+    content = inner.get("content")
+    if not isinstance(content, list) or not content:
+        return None
+    first = content[0]
+    if not isinstance(first, dict):
+        return None
+    text = first.get("text")
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _extract_query_results(result: Any) -> list:
+    """query returns a list of ranked chunks. Some gbrain versions wrap
+    in {results: [...]}; handle both shapes."""
+    parsed = _extract_gbrain_content(result)
+    if parsed is None:
+        return []
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        for k in ("results", "chunks", "hits", "items"):
+            v = parsed.get(k)
+            if isinstance(v, list):
+                return v
+    return []
+
+
+def _extract_list_pages_results(result: Any) -> list:
+    """list_pages returns a list of page rows."""
+    parsed = _extract_gbrain_content(result)
+    if parsed is None:
+        return []
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict) and isinstance(parsed.get("pages"), list):
+        return parsed["pages"]
+    return []
+
+
+def _extract_get_page_result(result: Any) -> Optional[Dict[str, Any]]:
+    """get_page returns a single page dict."""
+    parsed = _extract_gbrain_content(result)
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _handle_status_sweep_orchestration(
+    args: Dict[str, Any],
+    gbrain_url: str,
+    bearer: str,
+    timeout: float,
+) -> Dict[str, Any]:
+    """Composite status-sweep orchestrator (Option C from the design memo
+    at azure/design/recency-first-status-query.md).
+
+    Sequence — atomic, model cannot skip a step:
+      1. gbrain.query(source_id=project, recency='strong', limit=30) —
+         scope-filtered semantic + recency-boosted discovery.
+      2. Deduplicate by slug (query returns per-chunk rows).
+      3. Enrich top 8 unique slugs via gbrain.get_page (full text +
+         frontmatter for content-date extraction).
+      4. Pick anchor: newest structured doc by _ANCHOR_TITLE_RE. Fall
+         back to newest by content-date if no title match.
+      5. Deltas: pages newer than anchor by content-date, sorted desc,
+         capped at delta_limit.
+      6. Envelope: {anchor, deltas, sparse_flag, sample_size, source_id,
+                    warnings}.
+
+    Fallback layers:
+      - query fails / returns nothing → list_pages(sort=updated_desc,
+        limit=100) + client-side substring filter on slug/title.
+      - get_page fails on a candidate → skip it, log warning, continue.
+      - No pages could be enriched → return empty envelope with
+        sparse_flag=True + a warning.
+      - anchor pick returns None → all enriched items become deltas
+        (no anchor split).
+      - date parse ambiguity → falls through the _content_date chain
+        rather than crashing.
+
+    The persona rule in STATUS_QUERY.md remains as a safety net for
+    edge cases (drill-downs into a single delta, sparse-project handling).
+    """
+    project = str(args.get("project") or "").strip()
+    if not project:
+        return {
+            "isError": True,
+            "content": [{"type": "text",
+                         "text": "status_sweep requires project (e.g. 'project-mesec')"}],
+        }
+
+    # Derive a query hint. When the caller doesn't provide `topic`, we
+    # derive from the project name — the persona is expected to pass the
+    # user's actual question phrasing as `topic` (e.g. "what's the latest
+    # on Mesec" → topic="latest Mesec"), which triggers gbrain's recency
+    # intent classifier and pairs with source_id + recency='strong'.
+    # Note: fallback to the project name alone can under-recall when
+    # today's fresh content doesn't mention the project name in body
+    # (e.g. a scope-tagged CEO register whose title is a legal term).
+    # The `sparse_flag` in the envelope signals this cleanly so the
+    # persona widens rather than hallucinates.
+    topic_arg = str(args.get("topic") or "").strip()
+    if topic_arg:
+        topic = topic_arg
+    else:
+        stripped = project
+        for prefix in ("project-", "projects/"):
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix):]
+                break
+        topic = stripped.replace("-", " ").replace("_", " ").strip() or project
+
+    try:
+        delta_limit = int(args.get("delta_limit") or 5)
+    except (TypeError, ValueError):
+        delta_limit = 5
+    delta_limit = max(1, min(delta_limit, 10))
+
+    warnings: list = []
+    candidates: list = []
+
+    # Step 1 — Primary discovery: query with source_id + recency=strong.
+    # gbrain returns ranked chunks with slug + effective_date per row.
+    try:
+        q_result = _gbrain_tool_call(
+            gbrain_url, bearer, "query",
+            {"query": topic, "source_id": project, "recency": "strong", "limit": 30},
+            timeout,
+        )
+        candidates = _extract_query_results(q_result)
+        _log("info", "status_sweep: primary query returned",
+             project=project, topic=topic, count=len(candidates))
+    except urllib.error.HTTPError as exc:
+        _log("warn", "status_sweep: primary query HTTPError, will try list_pages fallback",
+             code=exc.code, project=project)
+        warnings.append(f"primary query HTTP {exc.code} — used list_pages fallback")
+    except Exception as exc:
+        _log("warn", "status_sweep: primary query failed, will try list_pages fallback",
+             error=str(exc), project=project)
+        warnings.append(f"primary query failed ({type(exc).__name__}) — used list_pages fallback")
+
+    # Fallback discovery: list_pages doesn't accept source_id, so fetch
+    # broad + filter client-side by slug/title substring match on the
+    # project name (heuristic — get_page verifies source_id afterward).
+    if not candidates:
+        try:
+            project_short = project
+            for prefix in ("project-", "projects/"):
+                if project_short.startswith(prefix):
+                    project_short = project_short[len(prefix):]
+                    break
+            needles = {project.lower(), project_short.lower(), topic.lower()}
+            lp_result = _gbrain_tool_call(
+                gbrain_url, bearer, "list_pages",
+                {"sort": "updated_desc", "limit": 100},
+                timeout,
+            )
+            all_pages = _extract_list_pages_results(lp_result)
+            candidates = [
+                p for p in all_pages
+                if isinstance(p, dict) and any(
+                    n in str(p.get("slug") or "").lower()
+                    or n in str(p.get("title") or "").lower()
+                    for n in needles if n
+                )
+            ]
+            _log("info", "status_sweep: list_pages fallback filtered",
+                 project=project, unfiltered=len(all_pages), filtered=len(candidates))
+        except Exception as exc:
+            _log("error", "status_sweep: list_pages fallback also failed",
+                 error=str(exc), project=project)
+            warnings.append(f"list_pages fallback failed: {type(exc).__name__}")
+
+    # Deduplicate by slug, preserving discovery order (ranker order or
+    # updated_desc order depending on which path fired).
+    seen: set = set()
+    unique: list = []
+    for c in candidates:
+        if not isinstance(c, dict):
+            continue
+        slug = str(c.get("slug") or "").strip()
+        if slug and slug not in seen:
+            seen.add(slug)
+            unique.append(c)
+
+    if not unique:
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({
+                    "anchor": None,
+                    "deltas": [],
+                    "sparse_flag": True,
+                    "sample_size": 0,
+                    "source_id": project,
+                    "warnings": warnings + [
+                        f"no candidates found for project={project} — "
+                        "either the project has no content or the sender "
+                        "lacks read access (RLS)."
+                    ],
+                })
+            }]
+        }
+
+    # Step 2 — Enrich top-8 via get_page. 8 is bounded so latency stays
+    # under ~5s; 8 pages is enough for anchor + up to 7 deltas which
+    # exceeds the delta_limit cap of 10.
+    enrich_max = min(8, len(unique))
+    top = unique[:enrich_max]
+
+    enriched: list = []
+    for c in top:
+        slug = str(c.get("slug") or "").strip()
+        if not slug:
+            continue
+        try:
+            gp_result = _gbrain_tool_call(
+                gbrain_url, bearer, "get_page", {"slug": slug}, timeout,
+            )
+            page = _extract_get_page_result(gp_result)
+            if not page:
+                warnings.append(f"get_page returned empty for {slug} — skipped")
+                continue
+            # Belt-and-braces: verify source_id matches project (relevant
+            # for the list_pages fallback path where we filtered by
+            # substring — a stray match might belong to another scope).
+            page_source = str(page.get("source_id") or "").strip()
+            if page_source and page_source != project:
+                _log("info", "status_sweep: dropped cross-scope match",
+                     slug=slug, page_source=page_source, expected=project)
+                continue
+            enriched.append(page)
+        except urllib.error.HTTPError as exc:
+            _log("warn", "status_sweep: get_page HTTPError, skipping candidate",
+                 slug=slug, code=exc.code)
+            warnings.append(f"get_page {slug}: HTTP {exc.code}, skipped")
+        except Exception as exc:
+            _log("warn", "status_sweep: get_page failed, skipping candidate",
+                 slug=slug, error=str(exc))
+            warnings.append(f"get_page {slug}: {type(exc).__name__}, skipped")
+
+    if not enriched:
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({
+                    "anchor": None,
+                    "deltas": [],
+                    "sparse_flag": True,
+                    "sample_size": 0,
+                    "source_id": project,
+                    "warnings": warnings + [
+                        "no pages could be enriched — every candidate get_page failed"
+                    ],
+                })
+            }]
+        }
+
+    # Step 3 — Anchor + deltas split by content date.
+    anchor = _pick_anchor(enriched)
+    if anchor is None:
+        # Degenerate case: nothing matches the anchor regex AND enriched
+        # is somehow non-empty (shouldn't happen since fallback is
+        # "newest overall"). Return everything as deltas.
+        deltas = sorted(enriched, key=lambda p: _content_date(p) or "", reverse=True)[:delta_limit]
+        warnings.append("no anchor identified — returned all enriched items as deltas")
+    else:
+        anchor_date = _content_date(anchor) or ""
+        deltas_pool = [
+            p for p in enriched
+            if p.get("slug") != anchor.get("slug")
+            and _content_date(p)
+            and (_content_date(p) or "") > anchor_date
+        ]
+        deltas_pool.sort(key=lambda p: _content_date(p) or "", reverse=True)
+        deltas = deltas_pool[:delta_limit]
+
+    sparse = len(deltas) < 3
+    if sparse:
+        warnings.append(
+            f"sparse project: only {len(deltas)} delta(s) newer than anchor — "
+            "persona should surface this explicitly in the reply"
+        )
+
+    envelope = {
+        "anchor": _shape_page_for_envelope(anchor) if anchor else None,
+        "deltas": [_shape_page_for_envelope(p) for p in deltas],
+        "sparse_flag": sparse,
+        "sample_size": len(deltas),
+        "source_id": project,
+        "warnings": warnings,
+    }
+    return {"content": [{"type": "text", "text": json.dumps(envelope)}]}
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -211,7 +604,10 @@ def _handle_tools_list() -> Dict[str, Any]:
                     "documents). Returns ranked passages with page "
                     "slugs. RLS-enforced — results are filtered to "
                     "what the sender's role can read; forbidden "
-                    "sources never appear in the result set."
+                    "sources never appear in the result set. For "
+                    "status/progress/latest-on questions, prefer the "
+                    "composite `status_sweep` tool instead — it "
+                    "enforces the anchor+deltas discipline atomically."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -222,6 +618,51 @@ def _handle_tools_list() -> Dict[str, Any]:
                             "type": "integer",
                             "description": "Max passages (default 8).",
                             "minimum": 1, "maximum": 50,
+                        },
+                        "source_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional. Scope the query to a single "
+                                "gbrain source (e.g. 'project-mesec', "
+                                "'finance', 'leadership'). Default: all "
+                                "the sender's authorized sources. Pass "
+                                "'__all__' to explicitly span all "
+                                "sources when a source is set at the "
+                                "session level."
+                            ),
+                        },
+                        "recency": {
+                            "type": "string",
+                            "enum": ["off", "on", "strong"],
+                            "description": (
+                                "Recency boost on the ranker. 'off' for "
+                                "canonical-truth questions ('who is X'); "
+                                "'on' for standard questions with mild "
+                                "freshness tilt; 'strong' for status / "
+                                "progress / 'latest' questions where "
+                                "freshness dominates relevance. When "
+                                "omitted, gbrain auto-detects from "
+                                "phrasing — but the auto-detect is "
+                                "weak for project-* scopes; be explicit."
+                            ),
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": (
+                                "Optional. Filter to pages whose "
+                                "effective_date is >= this. ISO-8601 "
+                                "(YYYY-MM-DD or full timestamp) OR "
+                                "relative shorthand ('7d', '2w', '1y'). "
+                                "Combine with `until` for a range."
+                            ),
+                        },
+                        "until": {
+                            "type": "string",
+                            "description": (
+                                "Optional. Filter to effective_date <= "
+                                "this. Same format as `since`. YYYY-MM-DD "
+                                "lands at end-of-day."
+                            ),
                         },
                     },
                     "required": ["sender_id", "q"],
@@ -292,6 +733,64 @@ def _handle_tools_list() -> Dict[str, Any]:
                     "required": ["sender_id"],
                 },
             },
+            {
+                "name": "status_sweep",
+                "description": (
+                    "STATUS PRIMITIVE — atomic recency-first sweep for "
+                    "a project. USE FOR: 'what's the latest on X', "
+                    "'what's outstanding on Y', 'update on Z', "
+                    "'progress on <project>', 'any news on <project>'. "
+                    "DO NOT USE FOR: definitional questions ('who is "
+                    "X'), semantic search inside a project, or single-"
+                    "page lookups — use `query` or `get_page` for "
+                    "those. Returns (a) the newest structured anchor "
+                    "doc (checklist/dashboard/status/tracker/summary/"
+                    "memo/register/briefing) and (b) up to N items "
+                    "dated newer than that anchor, each with body + "
+                    "content_date + tags + source_id. Enforces the "
+                    "two-source rule (STATUS_QUERY.md) at the tool "
+                    "boundary so the model cannot skip discovery. "
+                    "RLS-enforced same as query/get_page — the sender "
+                    "must have read access to the project scope."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sender_id": _SENDER_LID_SCHEMA,
+                        "project": {
+                            "type": "string",
+                            "description": (
+                                "Project source ID (matches gbrain "
+                                "slug namespace, e.g. 'project-mesec'). "
+                                "Sender must have read access to this "
+                                "scope via allowed_sources (RLS-"
+                                "enforced at SQL layer)."
+                            ),
+                        },
+                        "topic": {
+                            "type": "string",
+                            "description": (
+                                "Optional query hint. Defaults to a "
+                                "derived query from the project name. "
+                                "Use when the user's status question "
+                                "narrows the topic (e.g. 'latest on "
+                                "the Mandate Letter for Mesec' → "
+                                "topic='Mandate Letter')."
+                            ),
+                        },
+                        "delta_limit": {
+                            "type": "integer",
+                            "minimum": 1, "maximum": 10,
+                            "description": (
+                                "Max delta items to return after the "
+                                "anchor (default 5). Cap 10 to keep "
+                                "the response bounded."
+                            ),
+                        },
+                    },
+                    "required": ["sender_id", "project"],
+                },
+            },
         ]
     }
 
@@ -355,18 +854,39 @@ def _handle_tools_call(
         }
 
     # Tool-specific argument shaping — pass through what gbrain expects.
-    if name in ("query", "search"):
+    # status_sweep is a Hermes-side composite; it doesn't map 1:1 to a
+    # gbrain tool. Dispatch to the orchestrator after bearer mint.
+    if name == "status_sweep":
+        gbrain_args = {}  # unused for status_sweep; orchestrator builds its own
+    elif name in ("query", "search"):
         q = str(args.get("q") or "").strip()
         if not q:
             return {"isError": True, "content": [{"type": "text", "text": f"{name} requires q"}]}
-        # gbrain's  and  operations both take the search
-        # text under the canonical name  (not ). Our exposed
-        # tool schema uses  for brevity at the chat-tool layer; we
+        # gbrain's `query` and `search` operations both take the search
+        # text under the canonical name `query` (not `q`). Our exposed
+        # tool schema uses `q` for brevity at the chat-tool layer; we
         # translate here. See gbrain operations.ts: search/query both
-        # declare .
+        # declare `query`.
         gbrain_args: Dict[str, Any] = {"query": q}
         if isinstance(args.get("limit"), int):
             gbrain_args["limit"] = args["limit"]
+        # Thread through the recency/source/date knobs when the model
+        # sets them. Only present on `query` (not `search`) — search is
+        # a plain keyword primitive on gbrain's side. Silently drop any
+        # of these if the caller included them on `search`.
+        if name == "query":
+            source_id = str(args.get("source_id") or "").strip()
+            if source_id:
+                gbrain_args["source_id"] = source_id
+            recency = str(args.get("recency") or "").strip().lower()
+            if recency in ("off", "on", "strong"):
+                gbrain_args["recency"] = recency
+            since = str(args.get("since") or "").strip()
+            if since:
+                gbrain_args["since"] = since
+            until = str(args.get("until") or "").strip()
+            if until:
+                gbrain_args["until"] = until
     elif name == "get_page":
         slug = str(args.get("slug") or "").strip()
         if not slug:
@@ -375,7 +895,7 @@ def _handle_tools_call(
     else:  # list_pages
         # gbrain list_pages has no per-call source filter — scope is
         # derived from the subject's allowed_sources. If the caller
-        # passes  we drop it (legacy schema field), and warn
+        # passes source we drop it (legacy schema field), and warn
         # in the audit log so the model can learn to omit it.
         gbrain_args = {}
         if isinstance(args.get("limit"), int):
@@ -402,6 +922,40 @@ def _handle_tools_call(
                 ),
             }],
         }
+
+    # status_sweep — composite orchestrator. Runs 1× query + up to 8×
+    # get_page under the same bearer. Errors handled internally with
+    # multi-layer fallbacks; envelope always returns.
+    if name == "status_sweep":
+        _log("info", "subject read dispatch",
+             sender=sender_id, role=role or "unknown",
+             tool=name, project=str(args.get("project") or ""),
+             topic=str(args.get("topic") or "").strip() or "(derived)")
+        try:
+            return _handle_status_sweep_orchestration(args, gbrain_url, bearer, timeout)
+        except urllib.error.HTTPError as exc:
+            # Only reached if orchestration re-raises (it currently
+            # catches HTTPError on each sub-call). Belt-and-braces.
+            if exc.code == 401:
+                try:
+                    token_cache.invalidate(sender_id)
+                except Exception:
+                    pass
+            _log("error", "status_sweep top-level HTTPError",
+                 code=exc.code, sender=sender_id)
+            return {
+                "isError": True,
+                "content": [{"type": "text",
+                             "text": f"status_sweep HTTP {exc.code}"}],
+            }
+        except Exception as exc:
+            _log("error", "status_sweep top-level exception",
+                 error=str(exc), sender=sender_id)
+            return {
+                "isError": True,
+                "content": [{"type": "text",
+                             "text": f"status_sweep failed: {type(exc).__name__}: {exc}"}],
+            }
 
     _log("info", "subject read dispatch",
          sender=sender_id, role=role or "unknown",
