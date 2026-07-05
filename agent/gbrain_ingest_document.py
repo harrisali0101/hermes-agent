@@ -70,7 +70,42 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import subprocess
+
+# Resolve the gbrain CLI binary path at import time. shutil.which honours
+# the process PATH; if the stdio-MCP subprocess PATH doesn't include the
+# Bun global bin dir where gbrain lives, fall back to the known install
+# path (verified via `sudo find /home -name gbrain 2>/dev/null` on the VM,
+# 2026-07-05). Using a plain "gbrain" string previously failed with
+# `FileNotFoundError: 'gbrain'` in production; the outer error handler
+# caught the exception but the calling MCP tool did not surface the
+# failure, so this constant is the fix-at-source.
+_GBRAIN_BIN = (
+    shutil.which("gbrain")
+    or "/home/hermes-user/.bun/bin/gbrain"
+)
+
+# The gbrain CLI is a Bun shebang script (`#!/usr/bin/env bun`), so the
+# subprocess PATH must include the Bun bin dir or the script can't start
+# (`env: 'bun': No such file or directory`, exit code 127). Under
+# systemd + fetch-secrets, the parent hermes process's PATH sometimes
+# omits Bun's install location. We build the child env explicitly so
+# `gbrain` and `bun` both resolve regardless of the parent PATH.
+_BUN_BIN_DIR = "/home/hermes-user/.bun/bin"
+
+
+def _gbrain_subprocess_env() -> dict:
+    """Return an env dict for gbrain CLI subprocess calls with Bun on PATH."""
+    env = dict(os.environ)
+    existing_path = env.get("PATH", "")
+    if _BUN_BIN_DIR not in existing_path.split(os.pathsep):
+        env["PATH"] = (
+            _BUN_BIN_DIR + os.pathsep + existing_path
+            if existing_path
+            else _BUN_BIN_DIR
+        )
+    return env
 import tempfile
 import urllib.error
 import urllib.request
@@ -456,10 +491,11 @@ def _gbrain_find_by_content_hash(source_id: str, content_hash: str
     """
     try:
         r = subprocess.run(
-            ["gbrain", "search", "--source", source_id,
+            [_GBRAIN_BIN, "search", "--source", source_id,
              "--frontmatter", f"{FRONTMATTER_HASH_KEY}={content_hash}",
              "--format", "json"],
             capture_output=True, text=True, timeout=30,
+            env=_gbrain_subprocess_env(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         logger.debug("gbrain search unavailable: %s", exc)
@@ -532,10 +568,11 @@ def _gbrain_capture(*, slug: str, source_id: str, title: str,
         staged = fh.name
     try:
         r = subprocess.run(
-            ["gbrain", "capture", "--file", staged,
+            [_GBRAIN_BIN, "capture", "--file", staged,
              "--source", source_id, "--slug", slug,
              "--title", title, "--type", "document"],
             capture_output=True, text=True, timeout=120,
+            env=_gbrain_subprocess_env(),
         )
     finally:
         try:

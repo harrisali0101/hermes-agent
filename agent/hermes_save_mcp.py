@@ -2604,9 +2604,38 @@ def _handle_save_document_to_scope(
             "detail": str(exc),
         })
 
+    # scopes.yaml `scopes.<scope>.gbrain_source` is the CANONICAL gbrain
+    # source id (constrained to [a-z0-9-]{1,32} — hyphens only, no
+    # underscores). Track A's scope names (from scopes.yaml keys) are
+    # Python-identifier style with underscores (e.g. project_mesec, super_admin).
+    # Look up the mapping; fall back to a hyphen-translation of the scope
+    # name if the scope entry lacks a gbrain_source field. Existing
+    # save_to_scope hits gbrain via the MCP HTTP API which doesn't enforce
+    # the CLI regex; this handler uses `gbrain capture` under the hood, so
+    # the mapping is mandatory here.
+    scope_cfg = ((scopes_data or {}).get("scopes") or {}).get(scope) or {}
+    gbrain_source_id = (
+        str(scope_cfg.get("gbrain_source") or "").strip()
+        or scope.replace("_", "-")
+    )
+    # Belt-and-braces: gbrain CLI enforces this at the receiver side too.
+    if not re.match(r"^[a-z0-9-]{1,32}$", gbrain_source_id):
+        _log(
+            "error", "save_document_to_scope: derived gbrain_source_id invalid",
+            sender=sender_id, scope=scope, gbrain_source=gbrain_source_id,
+        )
+        return _reply(True, {
+            "status": "error",
+            "reason": "invalid_gbrain_source",
+            "detail": f"scopes.yaml scope '{scope}' maps to '{gbrain_source_id}' "
+                      f"which does not match [a-z0-9-]{{1,32}}. Fix the "
+                      f"gbrain_source field in scopes.yaml.",
+        })
+
     _log(
         "info", "save_document_to_scope dispatch",
-        sender=sender_id, role=role, scope=scope, slug=derived_slug,
+        sender=sender_id, role=role, scope=scope,
+        gbrain_source=gbrain_source_id, slug=derived_slug,
         size_bytes=size_bytes, mime_type=mime_type,
         content_hash=content_hash,
     )
@@ -2614,7 +2643,7 @@ def _handle_save_document_to_scope(
     try:
         result = gbrain_ingest_document(
             local_path=real_path,
-            source_id=scope,
+            source_id=gbrain_source_id,
             slug=derived_slug,
             title=title,
             mime_type=mime_type,
@@ -2630,26 +2659,65 @@ def _handle_save_document_to_scope(
             "detail": str(exc),
         })
 
-    # IngestResult contract (Track B):
-    #   result.slug          — str, final slug (may differ from derived)
-    #   result.page_id       — str, gbrain page id
-    #   result.content_hash  — str, hex sha256 stored on the page
-    #   result.was_duplicate — bool, True when hash matched existing page
-    #   result.warnings      — list[str], non-fatal notices (OCR fallbacks…)
+    # IngestResult contract (Track B — see agent/gbrain_ingest_document.py):
+    #   result.status         — str, one of {"created", "updated",
+    #                           "already_ingested", "failed", "dry_run"}
+    #   result.slug           — str, final slug (may differ from derived);
+    #                           "" on failure
+    #   result.page_id        — Optional[int], gbrain page id (None if not
+    #                           returned by CLI)
+    #   result.content_hash   — str, hex sha256 stored on the page
+    #   result.chunks_created — int
+    #   result.warnings       — list[str], non-fatal notices (OCR fallback,
+    #                           embedding_failed, blob_mirror_failed, ...)
+    #   result.error          — Optional[str], present when status=="failed"
+    result_status = str(getattr(result, "status", "") or "").lower()
     slug_out = getattr(result, "slug", None) or derived_slug
     page_id = getattr(result, "page_id", None)
     hash_out = getattr(result, "content_hash", None) or content_hash
     warnings = list(getattr(result, "warnings", None) or [])
-    was_duplicate = bool(getattr(result, "was_duplicate", False))
 
-    status = "already_saved" if was_duplicate else "created_or_updated"
+    # Propagate failure from Track B. Previously this handler unconditionally
+    # returned "created_or_updated" regardless of result.status — a genuine
+    # capture failure (missing gbrain binary, gbrain CLI returncode!=0,
+    # blob mirror hard-fail, etc.) reached the caller as a success envelope.
+    # Now: failed status → isError=True with the reason surfaced.
+    if result_status == "failed":
+        error_detail = getattr(result, "error", None) or "unknown_ingest_failure"
+        _log(
+            "error", "save_document_to_scope: ingest returned failed",
+            sender=sender_id, scope=scope, slug=slug_out,
+            error=error_detail, warnings=len(warnings),
+        )
+        return _reply(True, {
+            "status": "error",
+            "reason": "ingest_failed",
+            "detail": error_detail,
+            "slug": slug_out,
+            "content_hash": hash_out,
+            "scope": scope,
+            "warnings": warnings,
+        })
+
+    if result_status == "already_ingested":
+        envelope_status = "already_saved"
+    elif result_status in ("created", "updated"):
+        envelope_status = "created_or_updated"
+    elif result_status == "dry_run":
+        envelope_status = "dry_run"
+    else:
+        # Unknown status — surface it verbatim rather than lie.
+        envelope_status = result_status or "unknown"
+        warnings.append(f"unknown_ingest_status:{result_status}")
+
     _log(
         "info", "save_document_to_scope success",
         sender=sender_id, scope=scope, slug=slug_out,
-        page_id=page_id, status=status, warnings=len(warnings),
+        page_id=page_id, ingest_status=result_status,
+        envelope_status=envelope_status, warnings=len(warnings),
     )
     return _reply(False, {
-        "status": status,
+        "status": envelope_status,
         "slug": slug_out,
         "page_id": page_id,
         "content_hash": hash_out,
