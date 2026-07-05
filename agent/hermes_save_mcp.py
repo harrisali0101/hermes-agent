@@ -2519,8 +2519,15 @@ def _handle_save_document_to_scope(
         })
 
     # ── Mime allowlist ─────────────────────────────────────────────────
+    # MIME type comparisons are case-insensitive per RFC 2045 §5.1
+    # ("Matching of media type and subtype is ALWAYS case-insensitive").
+    # Normalise the caller-supplied value to lowercase before checking
+    # against _ALLOWED_MIMES so `TEXT/PLAIN` and `text/plain` both work.
+    # Caught 2026-07-05 v2 verification battery.
     if not mime_type:
         mime_type = _infer_mime_from_extension(real_path)
+    if mime_type:
+        mime_type = mime_type.strip().lower()
     if not mime_type or mime_type not in _ALLOWED_MIMES:
         _log(
             "warn", "save_document_to_scope: unsupported mime",
