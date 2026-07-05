@@ -124,6 +124,23 @@ _DEFAULT_MIME = {
 # falls back to "audio file attachment" rendering in WhatsApp.
 _FFMPEG_PATH = shutil.which("ffmpeg")
 
+# Meta WhatsApp Cloud API accepts a limited set of document MIME types.
+# Anything outside this set triggers a graph error 100 (HTTP 400) on upload.
+# text/markdown is a common miss (Python guesses it correctly, Meta rejects).
+# When we detect an unsupported document mime, we coerce upload to text/plain
+# with a .txt basename so the recipient still receives the content instead
+# of the file being silently dropped. See _upload_media() below.
+_META_ACCEPTED_DOCUMENT_MIMES = frozenset({
+    "application/pdf",
+    "text/plain",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+})
+
 # Python's mimetypes module returns RFC-correct but real-world-uncommon
 # extensions for some types (audio/ogg → .oga since RFC 5334; audio/mp4
 # → .mp4 instead of the de-facto .m4a for voice notes). Our downstream
@@ -898,12 +915,30 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not mime_type:
             mime_type = _DEFAULT_MIME.get(media_kind, "application/octet-stream")
 
+        # Meta rejects unsupported document mimes with graph error 100.
+        # Coerce those uploads to text/plain + .txt so the file still reaches
+        # the recipient (rather than being dropped silently). Common trigger:
+        # text/markdown from a model-produced .md report.
+        upload_basename = os.path.basename(file_path)
+        if media_kind == "document" and mime_type not in _META_ACCEPTED_DOCUMENT_MIMES:
+            original_mime = mime_type
+            upload_basename = os.path.splitext(upload_basename)[0] + ".txt"
+            mime_type = "text/plain"
+            logger.info(
+                "[whatsapp_cloud] mime coercion: %s (%s) -> %s (%s) — "
+                "original not in Meta document allowlist",
+                os.path.basename(file_path),
+                original_mime,
+                upload_basename,
+                mime_type,
+            )
+
         url = self._graph_url("media")
         headers = {"Authorization": f"Bearer {self._access_token}"}
         try:
             with open(file_path, "rb") as fh:
                 files = {
-                    "file": (os.path.basename(file_path), fh, mime_type),
+                    "file": (upload_basename, fh, mime_type),
                     "messaging_product": (None, "whatsapp"),
                     "type": (None, mime_type),
                 }
