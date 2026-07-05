@@ -245,25 +245,35 @@ def _handle_status_sweep_orchestration(
     """Composite status-sweep orchestrator (Option C from the design memo
     at azure/design/recency-first-status-query.md).
 
-    Sequence — atomic, model cannot skip a step:
-      1. gbrain.query(source_id=project, recency='strong', limit=30) —
-         scope-filtered semantic + recency-boosted discovery.
-      2. Deduplicate by slug (query returns per-chunk rows).
-      3. Enrich top 8 unique slugs via gbrain.get_page (full text +
-         frontmatter for content-date extraction).
-      4. Pick anchor: newest structured doc by _ANCHOR_TITLE_RE. Fall
+    Sequence — atomic, model cannot skip a step (v2 2026-07-05):
+      1. gbrain.list_pages(sort='updated_desc', limit=100) — pure
+         chronological discovery across the caller's authorized sources
+         (RLS-enforced). No semantic filter → no under-recall on pages
+         whose body doesn't semantically match the project name.
+      2. Candidate build: substring-hit rows (slug/title contains the
+         project name) FIRST, then top-15 chronological overall
+         (belt-and-braces for pages whose slug lacks the project name,
+         e.g. `ceo-obligations-register-*` inside project-mesec).
+      3. FALLBACK — if list_pages returned nothing: gbrain.query with
+         source_id + recency='strong'. Semantic-narrow risk vs primary,
+         but any hit beats an empty envelope.
+      4. Deduplicate by slug, preserving priority order.
+      5. Enrich top 15 unique slugs via gbrain.get_page (full text +
+         frontmatter for content-date extraction + source_id verify).
+      6. Pick anchor: newest structured doc by _ANCHOR_TITLE_RE. Fall
          back to newest by content-date if no title match.
-      5. Deltas: pages newer than anchor by content-date, sorted desc,
+      7. Deltas: pages newer than anchor by content-date, sorted desc,
          capped at delta_limit.
-      6. Envelope: {anchor, deltas, sparse_flag, sample_size, source_id,
+      8. Envelope: {anchor, deltas, sparse_flag, sample_size, source_id,
                     warnings}.
 
     Fallback layers:
-      - query fails / returns nothing → list_pages(sort=updated_desc,
-        limit=100) + client-side substring filter on slug/title.
+      - list_pages fails → query with source_id + recency='strong'.
+      - Both fail → empty envelope with sparse_flag=True + warnings.
       - get_page fails on a candidate → skip it, log warning, continue.
-      - No pages could be enriched → return empty envelope with
-        sparse_flag=True + a warning.
+      - get_page succeeds but source_id != project → drop (cross-scope
+        leak from top-overall fetch).
+      - No pages could be enriched → empty envelope + warnings.
       - anchor pick returns None → all enriched items become deltas
         (no anchor split).
       - date parse ambiguity → falls through the _content_date chain
@@ -271,6 +281,12 @@ def _handle_status_sweep_orchestration(
 
     The persona rule in STATUS_QUERY.md remains as a safety net for
     edge cases (drill-downs into a single delta, sparse-project handling).
+
+    v1 (query-primary, shipped morning 2026-07-05) is retained as the
+    fallback path. v2 promotes chronological to primary based on the
+    5-message WhatsApp E2E test that revealed semantic under-recall
+    (CEO Closing Checklist missed the first sweep because "mesec" isn't
+    prominent in its body).
     """
     project = str(args.get("project") or "").strip()
     if not project:
@@ -291,6 +307,7 @@ def _handle_status_sweep_orchestration(
     # The `sparse_flag` in the envelope signals this cleanly so the
     # persona widens rather than hallucinates.
     topic_arg = str(args.get("topic") or "").strip()
+    caller_provided_topic = bool(topic_arg)
     if topic_arg:
         topic = topic_arg
     else:
@@ -310,60 +327,150 @@ def _handle_status_sweep_orchestration(
     warnings: list = []
     candidates: list = []
 
-    # Step 1 — Primary discovery: query with source_id + recency=strong.
-    # gbrain returns ranked chunks with slug + effective_date per row.
-    try:
-        q_result = _gbrain_tool_call(
-            gbrain_url, bearer, "query",
-            {"query": topic, "source_id": project, "recency": "strong", "limit": 30},
-            timeout,
-        )
-        candidates = _extract_query_results(q_result)
-        _log("info", "status_sweep: primary query returned",
-             project=project, topic=topic, count=len(candidates))
-    except urllib.error.HTTPError as exc:
-        _log("warn", "status_sweep: primary query HTTPError, will try list_pages fallback",
-             code=exc.code, project=project)
-        warnings.append(f"primary query HTTP {exc.code} — used list_pages fallback")
-    except Exception as exc:
-        _log("warn", "status_sweep: primary query failed, will try list_pages fallback",
-             error=str(exc), project=project)
-        warnings.append(f"primary query failed ({type(exc).__name__}) — used list_pages fallback")
+    # Derive project needles for the substring pre-filter, used to
+    # prioritise candidates whose slug or title mentions the project by
+    # name (email-2026-06-19-mesec-*, etc.). Belt-and-braces catch for
+    # pages whose slug doesn't carry the name (ceo-obligations-register-*)
+    # is handled by also including the top-N chronological items overall.
+    project_short = project
+    for prefix in ("project-", "projects/"):
+        if project_short.startswith(prefix):
+            project_short = project_short[len(prefix):]
+            break
+    needles = {n for n in (project.lower(), project_short.lower()) if n}
 
-    # Fallback discovery: list_pages doesn't accept source_id, so fetch
-    # broad + filter client-side by slug/title substring match on the
-    # project name (heuristic — get_page verifies source_id afterward).
-    if not candidates:
+    # Step 1 — Discovery. Two modes based on whether the caller narrowed
+    # the topic:
+    #
+    #   NARROW MODE (caller-provided topic like "Mandate Letter"):
+    #     query(query=topic, source_id=project, recency='strong', limit=30)
+    #     is primary. Semantic filtering matters — the caller is asking
+    #     about a SPECIFIC facet of the project, not "everything recent".
+    #     list_pages fills gaps if query is empty (rare).
+    #
+    #   LATEST MODE (topic derived from project name, i.e. no narrowing):
+    #     list_pages(sort='updated_desc', limit=100) is primary — pure
+    #     chronological across the caller's allowed_sources. No semantic
+    #     filter → no under-recall on pages whose body doesn't mention
+    #     the project name (e.g. "CEO obligations register" filed under
+    #     project-mesec but semantically about SPA/MSA legal terms).
+    #     Substring pre-filter (project name in slug/title) backfills
+    #     older in-project items beyond position 15.
+    #
+    # Both modes converge at Step 2 (dedup + enrich + anchor/deltas).
+    if caller_provided_topic:
+        # NARROW: query-primary path.
         try:
-            project_short = project
-            for prefix in ("project-", "projects/"):
-                if project_short.startswith(prefix):
-                    project_short = project_short[len(prefix):]
-                    break
-            needles = {project.lower(), project_short.lower(), topic.lower()}
+            q_result = _gbrain_tool_call(
+                gbrain_url, bearer, "query",
+                {"query": topic, "source_id": project, "recency": "strong", "limit": 30},
+                timeout,
+            )
+            candidates = _extract_query_results(q_result)
+            _log("info", "status_sweep NARROW: primary query returned",
+                 project=project, topic=topic, count=len(candidates))
+        except urllib.error.HTTPError as exc:
+            _log("warn", "status_sweep NARROW: primary query HTTPError, will try list_pages fallback",
+                 code=exc.code, project=project)
+            warnings.append(f"NARROW primary query HTTP {exc.code} — using list_pages fallback")
+        except Exception as exc:
+            _log("warn", "status_sweep NARROW: primary query failed, will try list_pages fallback",
+                 error=str(exc), project=project)
+            warnings.append(f"NARROW primary query failed ({type(exc).__name__}) — using list_pages fallback")
+
+        # Fallback for NARROW mode: list_pages + substring filter (same
+        # heuristic as LATEST mode's substr_hits but also uses the topic
+        # as a needle — catches project items with the topic keyword in
+        # slug/title).
+        if not candidates:
+            try:
+                lp_result = _gbrain_tool_call(
+                    gbrain_url, bearer, "list_pages",
+                    {"sort": "updated_desc", "limit": 100},
+                    timeout,
+                )
+                all_meta = _extract_list_pages_results(lp_result)
+                topic_needles = {n for n in (topic.lower(),
+                                             topic.lower().replace(" ", "-")) if n}
+                candidates = [
+                    p for p in all_meta
+                    if isinstance(p, dict) and any(
+                        n in str(p.get("slug") or "").lower()
+                        or n in str(p.get("title") or "").lower()
+                        for n in (needles | topic_needles)
+                    )
+                ]
+                _log("info", "status_sweep NARROW: list_pages fallback filtered",
+                     project=project, topic=topic, count=len(candidates))
+                if candidates:
+                    warnings.append("NARROW: primary query returned nothing — used list_pages fallback with topic substring filter")
+            except Exception as exc:
+                _log("error", "status_sweep NARROW: list_pages fallback also failed",
+                     error=str(exc), project=project)
+                warnings.append(f"list_pages fallback failed: {type(exc).__name__}")
+
+    else:
+        # LATEST: list_pages-primary path.
+        try:
             lp_result = _gbrain_tool_call(
                 gbrain_url, bearer, "list_pages",
                 {"sort": "updated_desc", "limit": 100},
                 timeout,
             )
-            all_pages = _extract_list_pages_results(lp_result)
-            candidates = [
-                p for p in all_pages
+            all_meta = _extract_list_pages_results(lp_result)
+            _log("info", "status_sweep LATEST: primary list_pages returned",
+                 project=project, count=len(all_meta))
+            # Build candidate ordering: TOP-15 chronological FIRST (they
+            # are the newest across the caller's allowed_sources —
+            # guaranteed to include any recently-touched page in the
+            # project, whether or not its slug carries the project name
+            # — e.g. a `ceo-obligations-register-*` under project-mesec).
+            # Substring hits (project name in slug/title) BACKFILL beyond
+            # position 15 to catch older in-project items that fell out
+            # of the chronological top slice.
+            #
+            # Dedup below preserves this priority order (first-seen wins).
+            top_overall = all_meta[:15]
+            substr_hits = [
+                p for p in all_meta[15:]
                 if isinstance(p, dict) and any(
                     n in str(p.get("slug") or "").lower()
                     or n in str(p.get("title") or "").lower()
-                    for n in needles if n
+                    for n in needles
                 )
             ]
-            _log("info", "status_sweep: list_pages fallback filtered",
-                 project=project, unfiltered=len(all_pages), filtered=len(candidates))
+            candidates = top_overall + substr_hits
+        except urllib.error.HTTPError as exc:
+            _log("warn", "status_sweep LATEST: primary list_pages HTTPError, will try query fallback",
+                 code=exc.code, project=project)
+            warnings.append(f"LATEST primary list_pages HTTP {exc.code} — using query fallback")
         except Exception as exc:
-            _log("error", "status_sweep: list_pages fallback also failed",
+            _log("warn", "status_sweep LATEST: primary list_pages failed, will try query fallback",
                  error=str(exc), project=project)
-            warnings.append(f"list_pages fallback failed: {type(exc).__name__}")
+            warnings.append(f"LATEST primary list_pages failed ({type(exc).__name__}) — using query fallback")
 
-    # Deduplicate by slug, preserving discovery order (ranker order or
-    # updated_desc order depending on which path fired).
+        # Fallback for LATEST mode: query with source_id + recency='strong'.
+        # Fires only if list_pages returned nothing (rare — new senders
+        # or HTTP fail).
+        if not candidates:
+            try:
+                q_result = _gbrain_tool_call(
+                    gbrain_url, bearer, "query",
+                    {"query": topic, "source_id": project, "recency": "strong", "limit": 30},
+                    timeout,
+                )
+                candidates = _extract_query_results(q_result)
+                _log("info", "status_sweep LATEST: fallback query returned",
+                     project=project, topic=topic, count=len(candidates))
+                if candidates:
+                    warnings.append("LATEST: primary list_pages returned nothing — used query fallback")
+            except Exception as exc:
+                _log("error", "status_sweep LATEST: fallback query also failed",
+                     error=str(exc), project=project)
+                warnings.append(f"query fallback failed: {type(exc).__name__}")
+
+    # Deduplicate by slug, preserving discovery order (substring hits
+    # first, then chronological, then query fallback if it fired).
     seen: set = set()
     unique: list = []
     for c in candidates:
@@ -393,10 +500,13 @@ def _handle_status_sweep_orchestration(
             }]
         }
 
-    # Step 2 — Enrich top-8 via get_page. 8 is bounded so latency stays
-    # under ~5s; 8 pages is enough for anchor + up to 7 deltas which
-    # exceeds the delta_limit cap of 10.
-    enrich_max = min(8, len(unique))
+    # Step 3 — Enrich top-15 via get_page. Bumped from v1's 8 → 15 to
+    # accommodate the chronological-primary path: substring hits pick
+    # up in-project items across the recent tail; the top-overall block
+    # backstops pages whose slug doesn't carry the project name. 15 keeps
+    # latency ~4-5s in the worst case (15 sequential get_pages @ ~300ms
+    # each). Downstream anchor+delta selection caps output at delta_limit.
+    enrich_max = min(15, len(unique))
     top = unique[:enrich_max]
 
     enriched: list = []
