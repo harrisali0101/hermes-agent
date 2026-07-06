@@ -475,21 +475,41 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # ``azure/config/rules/VOICE_LANE.md`` (persona contract) and
         # ``azure/design/voice-round-trip.md`` (design memo) in the
         # hermes-personal-agent repo.
-        stripped_content, voice_intended = self._extract_voice_marker(content)
-        if stripped_content is not content:
-            # Marker was present — either honour it (voice send) or
-            # strip and fall through to text. The user must never see
-            # the raw ``[VOICE_REPLY]`` prefix in text output.
-            content = stripped_content
-            if voice_intended and self._last_inbound_was_voice_by_chat.get(chat_id) == "1":
-                voice_result = await self._maybe_send_voice_reply(
-                    chat_id, content, reply_to=reply_to,
-                )
-                if voice_result is not None:
-                    return voice_result
-                # Voice path signalled fallback — continue with the
-                # (marker-stripped) text send below. Reply is never
-                # dropped.
+        #
+        # Wrapped in a broad ``except Exception`` so a bug ANYWHERE in
+        # the voice path (e.g. a signature-mismatch TypeError raised
+        # before the inner try/except blocks — see 2026-07-06 incident)
+        # falls back to text instead of surfacing a traceback to the
+        # user via the agent's error reporter.
+        try:
+            stripped_content, voice_intended = self._extract_voice_marker(content)
+            if stripped_content is not content:
+                # Marker was present — either honour it (voice send) or
+                # strip and fall through to text. The user must never see
+                # the raw ``[VOICE_REPLY]`` prefix in text output.
+                content = stripped_content
+                if voice_intended and self._last_inbound_was_voice_by_chat.get(chat_id) == "1":
+                    voice_result = await self._maybe_send_voice_reply(
+                        chat_id, content, reply_to=reply_to,
+                    )
+                    if voice_result is not None:
+                        return voice_result
+                    # Voice path signalled fallback — continue with the
+                    # (marker-stripped) text send below. Reply is never
+                    # dropped.
+        except Exception:
+            logger.exception(
+                "[whatsapp_cloud] voice-lane: unhandled error in marker "
+                "extraction / voice dispatch — falling back to text send"
+            )
+            # Best-effort strip: if _extract_voice_marker itself threw
+            # before returning, ensure the raw marker never reaches the
+            # user in the fallback text send. We use a re.sub with the
+            # same anchored regex the extractor uses.
+            try:
+                content = self._VOICE_MARKER_RE.sub("", content, count=1)
+            except Exception:
+                pass
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self._outgoing_chunk_limit())
@@ -1008,6 +1028,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         caption: Optional[str] = None,
         filename: Optional[str] = None,
         reply_to: Optional[str] = None,
+        voice: bool = False,
     ) -> SendResult:
         """POST a media message referencing either an uploaded media_id or
         a public ``link``.
@@ -1015,6 +1036,13 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         Exactly one of ``media_id`` or ``media_link`` must be set. Captions
         and filenames are passed through where Meta accepts them (caption
         on image/video/document; filename on document only).
+
+        ``voice=True`` (audio-kind only) adds ``"voice": true`` to the audio
+        object. Required by Meta to render as the native voice-note bubble
+        (mic icon + waveform + auto-download) instead of a generic audio
+        attachment. Per Meta's docs: voice messages require .ogg files with
+        the OPUS codec; other formats will not render as voice notes even
+        with the flag set.
         """
         if self._http_client is None:
             return SendResult(success=False, error="Not connected")
@@ -1039,6 +1067,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             media_block["caption"] = caption
         if filename and media_kind == "document":
             media_block["filename"] = filename
+        if voice and media_kind == "audio":
+            media_block["voice"] = True
 
         payload: Dict[str, Any] = {
             "messaging_product": "whatsapp",
@@ -1248,25 +1278,45 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     # every accepted inbound; ``send()`` reads it before invoking the
     # voice path.
 
-    # Marker the persona attaches at the head of a voice-intended
-    # reply. Match at the very start, tolerate leading whitespace, and
-    # allow either a bare marker or the ``[VOICE_REPLY]\n\n<body>``
-    # shape VOICE_LANE.md documents.
-    _VOICE_MARKER_RE = re.compile(r"\A\s*\[VOICE_REPLY\]\s*\n?", re.IGNORECASE)
+    # Sentinel the persona embeds ANYWHERE in a voice-intended reply.
+    # Design change 2026-07-06: the earlier position-0 anchor kept
+    # failing because LLMs naturally acknowledge before acting
+    # ("That makes sense — [VOICE_REPLY]..."). Sentinel-anywhere is
+    # the industry-standard approach (Cognigy delimiter tokens,
+    # prompt-sentinel mask tokens).
+    #
+    # The regex accepts BOTH ``[VOICE_REPLY]`` and ``[[VOICE_REPLY]]``
+    # for backward compatibility during the migration. The persona
+    # rule in AGENTS.md now teaches the double-bracket form, but the
+    # model's cached skill docs / persistent memory may still carry
+    # the older single-bracket pattern from the position-0 era; both
+    # forms strip cleanly and route to the voice path.
+    _VOICE_MARKER_RE = re.compile(r"\[{1,2}VOICE_REPLY\]{1,2}", re.IGNORECASE)
 
     @classmethod
     def _extract_voice_marker(cls, content: str) -> tuple[str, bool]:
-        """Peel the ``[VOICE_REPLY]`` marker off the head of ``content``.
+        """Strip ALL ``[[VOICE_REPLY]]`` sentinels from ``content``.
 
-        Returns ``(stripped_content, voice_intended)``. When the marker
-        is ABSENT the returned tuple contains ``content`` itself (same
+        Returns ``(cleaned_content, voice_intended)``. When the sentinel
+        is absent the returned tuple contains ``content`` itself (same
         object) so callers can compare with ``is`` — allowing the fast
         path to skip the voice-lane logic entirely.
+
+        When present, ALL occurrences are removed (belt-and-braces —
+        prevents the raw sentinel from leaking to the user in the
+        text-fallback path if the persona embeds it more than once).
+        Whitespace runs collapsed to a single space around each strip
+        site so we don't leave awkward double-spaces mid-sentence.
         """
-        match = cls._VOICE_MARKER_RE.match(content)
-        if not match:
+        if not cls._VOICE_MARKER_RE.search(content):
             return content, False
-        return content[match.end():].lstrip(), True
+        # Replace each sentinel with a single space, then collapse
+        # runs of whitespace to single spaces, then strip.
+        cleaned = cls._VOICE_MARKER_RE.sub(" ", content)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\n[ \t]+", "\n", cleaned)
+        cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+        return cleaned.strip(), True
 
     async def _maybe_send_voice_reply(
         self,
@@ -1294,7 +1344,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # synchronous and blocking; run in the default executor so we
         # don't stall the aiohttp webhook loop for TTS's ~1s latency.
         try:
-            from agent.tts_azure_speech import tts_bytes, TTSError
+            from agent.tts_azure_speech import tts_bytes, TTSError, DEFAULT_VOICE_ID
         except ImportError:
             logger.warning(
                 "[whatsapp_cloud] voice-lane: agent.tts_azure_speech "
@@ -1302,9 +1352,32 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             )
             return None
 
+        # Resolve the active voice for this subject: per-subject pref →
+        # global default → AZURE_SPEECH_VOICE_ID env → hardcoded fallback.
+        # Config file is at /home/hermes-user/.hermes/voice_config.json,
+        # editable via the voice_set MCP tool. Import is guarded so an
+        # upstream checkout without the DIH additions still works.
+        try:
+            from agent.voice_config import resolve_voice
+            voice_id = resolve_voice(
+                chat_id,
+                env_fallback=os.environ.get("AZURE_SPEECH_VOICE_ID"),
+                hard_fallback=DEFAULT_VOICE_ID,
+            )
+        except ImportError:
+            voice_id = os.environ.get("AZURE_SPEECH_VOICE_ID") or DEFAULT_VOICE_ID
+        except Exception:
+            logger.exception(
+                "[whatsapp_cloud] voice-lane: voice_config lookup failed "
+                "— using env/default voice"
+            )
+            voice_id = os.environ.get("AZURE_SPEECH_VOICE_ID") or DEFAULT_VOICE_ID
+
         loop = asyncio.get_event_loop()
         try:
-            audio_bytes = await loop.run_in_executor(None, tts_bytes, text)
+            audio_bytes = await loop.run_in_executor(
+                None, lambda: tts_bytes(text, voice=voice_id),
+            )
         except TTSError as exc:
             logger.warning(
                 "[whatsapp_cloud] voice-lane: TTS failed (%s) — "
@@ -1330,8 +1403,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # Write the synthesised audio to the same media-cache dir the
         # inbound path uses so the temp file is cleaned up by the same
         # rotation policy. ``.ogg`` extension so ``_upload_media`` picks
-        # the correct MIME.
-        cache_dir = Path(get_hermes_dir()) / "platforms" / "whatsapp_cloud" / "media"
+        # the correct MIME. Reuse the module-level constant that was
+        # already resolved via get_hermes_dir(new_subpath, old_name);
+        # calling get_hermes_dir() with no args here would raise
+        # TypeError (fixed 2026-07-06).
+        cache_dir = _INBOUND_MEDIA_CACHE
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -1362,8 +1438,15 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 )
                 return None
 
+            # ``voice=True`` is the Meta flag that triggers the native
+            # voice-note UI (mic icon, waveform, auto-download). Without
+            # it, WhatsApp renders the same OGG/Opus content as a plain
+            # audio attachment (headphones icon). Confirmed via Meta
+            # docs 2026-07-06 after Harris saw the audio-attachment
+            # rendering on the first test.
             result = await self._send_media(
                 chat_id, "audio", media_id=media_id, reply_to=reply_to,
+                voice=True,
             )
             if not result.success:
                 logger.warning(

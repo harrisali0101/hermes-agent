@@ -1051,6 +1051,83 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                     "required": ["sender_id", "target_phone"],
                 },
             },
+            {
+                "name": "voice_list",
+                "description": (
+                    "List the curated shortlist of voices available for the "
+                    "WhatsApp voice-lane (Azure Speech Services HD Neural). "
+                    "Use this when the user asks 'what voices do you have', "
+                    "'can you sound like Siri', 'change your voice', etc. "
+                    "Returns human labels (Ava, Andrew, Emma…) alongside the "
+                    "Azure voice_id needed by voice_set."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"sender_id": _SENDER_LID_SCHEMA},
+                    "required": ["sender_id"],
+                },
+            },
+            {
+                "name": "voice_get",
+                "description": (
+                    "Return the currently-active voice for a subject. "
+                    "Defaults to target='self' (the caller). "
+                    "target='default' returns the global default voice "
+                    "used for subjects who haven't set a preference. "
+                    "target=<wa_id> returns another user's preference "
+                    "(readable by anyone; super_admin required to CHANGE)."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sender_id": _SENDER_LID_SCHEMA,
+                        "target": {
+                            "type": "string",
+                            "description": (
+                                "'self' (default), 'default' (global "
+                                "default), or a wa_id (e.g. '923333717117')."
+                            ),
+                        },
+                    },
+                    "required": ["sender_id"],
+                },
+            },
+            {
+                "name": "voice_set",
+                "description": (
+                    "Change the WhatsApp voice-lane voice. "
+                    "target='self' (default) — always allowed, sets the "
+                    "caller's own voice. target='default' — super_admin "
+                    "only, changes the global default new users get. "
+                    "target=<wa_id> — super_admin only, sets that user's "
+                    "voice. voice_id must be from the curated shortlist "
+                    "(call voice_list first). Takes effect on the next "
+                    "voice reply; persists across restarts."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sender_id": _SENDER_LID_SCHEMA,
+                        "voice_id": {
+                            "type": "string",
+                            "description": (
+                                "Azure voice_id from the curated shortlist "
+                                "(e.g. 'en-US-AvaMultilingualNeural'). "
+                                "Call voice_list to see accepted values."
+                            ),
+                        },
+                        "target": {
+                            "type": "string",
+                            "description": (
+                                "'self' (default, always allowed), "
+                                "'default' (global default, super_admin "
+                                "only), or a wa_id (super_admin only)."
+                            ),
+                        },
+                    },
+                    "required": ["sender_id", "voice_id"],
+                },
+            },
         ]
     }
 
@@ -2802,6 +2879,15 @@ def _handle_tools_call(
         return _handle_reload_gateway(scopes_data, sender_id)
     if name == "send_template_message":
         return _handle_send_template_message(args, scopes_data, sender_id)
+    if name == "voice_list":
+        from agent.voice_config import handle_voice_list
+        return handle_voice_list(sender_id)
+    if name == "voice_get":
+        from agent.voice_config import handle_voice_get
+        return handle_voice_get(sender_id, args)
+    if name == "voice_set":
+        from agent.voice_config import handle_voice_set
+        return handle_voice_set(sender_id, role, args)
     if name == "save_document_to_scope":
         return _handle_save_document_to_scope(
             args, scopes_data, bearers, sender_id, role, gbrain_url, timeout,
