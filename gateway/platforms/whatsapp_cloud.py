@@ -300,6 +300,15 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # ``azure/design/voice-round-trip.md`` for the design memo.
         self._last_inbound_was_voice_by_chat: "OrderedDict[str, str]" = OrderedDict()
 
+        # Per-chat "have we seen this wa_id inbound yet, this process?"
+        # cache — feeds the first-contact hook that fires when someone
+        # onboarded via ``onboard_user`` sends their first-ever message.
+        # In-memory only (per-process); a hermes restart resets it and
+        # a subsequent inbound from that user re-logs the event. That's
+        # fine — the log line is observational, not a state gate. See
+        # ``agent/onboarding_saga.py`` for the paired write-side.
+        self._first_contact_logged_by_chat: "OrderedDict[str, str]" = OrderedDict()
+
         # Interactive-button state. Each maps a short id (embedded in the
         # outbound button payload) → the session/correlation key needed
         # by the gateway's resolver. See ``_handle_interactive_reply`` for
@@ -2270,6 +2279,35 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if chat_id:
             was_voice = "1" if message_type == MessageType.VOICE else "0"
             self._bounded_put(self._last_inbound_was_voice_by_chat, chat_id, was_voice)
+
+        # First-contact hook (per onboard_user single-flow onboarding).
+        # Emits ONE structured log line the first time a chat_id is
+        # seen in this process — pairs with the write-side saga in
+        # ``agent/onboarding_saga.py``. Purely observational: no state
+        # decision is made off this. The profile name from Meta's
+        # webhook contacts index is included when present so post-hoc
+        # audit can reconcile the name super_admin typed vs what the
+        # user has set on their WhatsApp profile. Wrapped in a broad
+        # ``except`` so a bad contacts_by_waid or logger-format quirk
+        # never blocks message processing.
+        if chat_id and chat_id not in self._first_contact_logged_by_chat:
+            try:
+                profile_name = ""
+                try:
+                    profile_name = str(contacts_by_waid.get(chat_id) or "").strip()
+                except Exception:
+                    profile_name = ""
+                logger.info(
+                    "[whatsapp_cloud] first_contact: chat_id=%s "
+                    "profile_name=%r wamid=%s type=%s",
+                    chat_id, profile_name, wamid, msg_type_str,
+                )
+            except Exception:
+                logger.debug(
+                    "[whatsapp_cloud] first_contact log suppressed for %s "
+                    "(non-fatal)", chat_id,
+                )
+            self._bounded_put(self._first_contact_logged_by_chat, chat_id, "1")
 
         return MessageEvent(
             text=body,

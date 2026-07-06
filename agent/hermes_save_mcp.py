@@ -774,10 +774,74 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 },
             },
             {
+                "name": "onboard_user",
+                "description": (
+                    "PREFERRED single-shot onboarding for the DIH pilot. "
+                    "Adds the phone to the gateway allowlist AND writes the "
+                    "role assignment to scopes.yaml AND spawns the gateway "
+                    "restart, all atomically. Under WhatsApp Cloud API, "
+                    "wa_id == phone (E.164 digits, no `+`) — so we do NOT "
+                    "need to wait for the new user's first message before "
+                    "assigning their role. Super_admin only; re-checked "
+                    "server-side. Available roles: " + ", ".join(available_roles)
+                    + " (super_admin is a separate high-privilege path — "
+                    "use approve_user with confirm_super_admin=true for that). "
+                    "Saga pattern: any step failure triggers full rollback so "
+                    "the user is never left half-onboarded. If the user is "
+                    "already fully on-scope with the same role+name, this is "
+                    "an idempotent no-op success. For the granular "
+                    "allowlist-only or approve-only flows, use "
+                    "add_to_allowlist / approve_user directly."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sender_id": _SENDER_LID_SCHEMA,
+                        "phone": {
+                            "type": "string",
+                            "description": (
+                                "Phone number, digits only, no '+'. Example: "
+                                "923333717117 for +92 333 3717117. "
+                                "International format; country code first."
+                            ),
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Human-readable name for scopes.yaml + audit "
+                                "(e.g., 'Tareq', 'Iyad Mazhar')."
+                            ),
+                        },
+                        "role": {
+                            "type": "string",
+                            "enum": available_roles,
+                            "description": (
+                                "One of the pilot roles. Do NOT pass "
+                                "'super_admin' here — use approve_user for "
+                                "that path (extra confirmation required)."
+                            ),
+                        },
+                        "memo": {
+                            "type": "string",
+                            "description": (
+                                "Optional one-line note that becomes the "
+                                "allowlist audit comment (e.g., 'CEO Iyad')."
+                            ),
+                        },
+                    },
+                    "required": ["sender_id", "phone", "name", "role"],
+                },
+            },
+            {
                 "name": "approve_user",
                 "description": (
                     "Onboard a new user to the DIH pilot by writing them "
-                    "into scopes.yaml with a role. Only super_admins (CEOs "
+                    "into scopes.yaml with a role. **PREFER `onboard_user` "
+                    "for the common case** (single-shot allowlist + "
+                    "scopes.yaml + restart). Reach for approve_user only "
+                    "when (a) granting super_admin, or (b) the phone is "
+                    "already on the allowlist from a prior step and you "
+                    "just need to assign a role. Only super_admins (CEOs "
                     "or dev-tier admins) may call this; the tool re-checks "
                     "authorization server-side and refuses if the caller "
                     "is not a super_admin. The new user's role determines "
@@ -1841,6 +1905,102 @@ def _handle_add_to_allowlist(
     )}]}
 
 
+def _handle_onboard_user(
+    args: Dict[str, Any],
+    scopes_data: Dict[str, Any],
+    sender_id: str,
+    env_path: str,
+    scopes_yaml_path: str,
+) -> Dict[str, Any]:
+    """Single-shot onboarding: allowlist + scopes.yaml + gateway restart.
+
+    Under WhatsApp Cloud API, ``wa_id == phone``, so we can fully
+    onboard from the phone alone — no wait for the first message. Saga
+    pattern with compensating rollbacks (see agent/onboarding_saga.py).
+    """
+    if not _is_super_admin(scopes_data, sender_id):
+        _log(
+            "warn", "onboard_user denied (not super_admin)",
+            sender=sender_id, phone=args.get("phone"),
+        )
+        return {
+            "isError": True,
+            "content": [{"type": "text", "text": (
+                "Onboarding is restricted to super_admins. Your sender "
+                "identity does not have super_admin privileges."
+            )}],
+        }
+    if not env_path:
+        return {
+            "isError": True,
+            "content": [{"type": "text", "text": (
+                "Allowlist file path not configured (HERMES_HERMES_ENV_PATH). "
+                "Ask Harris to fix the deployment."
+            )}],
+        }
+    if not scopes_yaml_path:
+        return {
+            "isError": True,
+            "content": [{"type": "text", "text": (
+                "scopes.yaml path not configured. Ask Harris to fix the deployment."
+            )}],
+        }
+
+    try:
+        from agent.onboarding_saga import run_onboard_user_saga
+    except ImportError as exc:
+        _log("error", "onboarding_saga import failed", error=str(exc))
+        return {
+            "isError": True,
+            "content": [{"type": "text", "text": (
+                f"onboarding_saga module not available: {exc}. "
+                "Fall back to add_to_allowlist + reload_gateway + "
+                "approve_user (legacy 3-step flow)."
+            )}],
+        }
+
+    available_roles = _role_list(scopes_data)
+    try:
+        result = run_onboard_user_saga(
+            phone=str(args.get("phone") or ""),
+            name=str(args.get("name") or ""),
+            role=str(args.get("role") or ""),
+            memo=str(args.get("memo") or "") or None,
+            sender_id=sender_id,
+            env_path=env_path,
+            scopes_yaml_path=scopes_yaml_path,
+            scopes_data=scopes_data,
+            read_allowlist_fn=_read_allowlist,
+            append_phone_fn=_append_phone_to_allowlist,
+            remove_phone_fn=_remove_phone_from_allowlist,
+            append_user_fn=_append_user_to_scopes_yaml,
+            remove_user_fn=_remove_user_from_scopes_yaml,
+            restart_gateway_fn=_restart_gateway_detached,
+            platform="whatsapp_cloud",
+            available_roles=available_roles,
+        )
+    except Exception as exc:
+        # SagaResult path should catch every internal error — this
+        # branch only fires on a bug in the saga runner itself.
+        _log(
+            "error", "onboard_user saga raised unexpectedly",
+            sender=sender_id, phone=args.get("phone"), error=str(exc),
+        )
+        return {
+            "isError": True,
+            "content": [{"type": "text", "text": (
+                f"Onboarding failed unexpectedly: {exc}. No changes are "
+                "guaranteed. Check gateway.log for state; you may need "
+                "to run add_to_allowlist / approve_user manually."
+            )}],
+        }
+
+    return {
+        "content": [{"type": "text", "text": result.text}],
+        **({"isError": True} if not result.ok else {}),
+    }
+
+
 def _handle_approve_user(
     args: Dict[str, Any],
     scopes_data: Dict[str, Any],
@@ -2857,6 +3017,10 @@ def _handle_tools_call(
         )
     if name == "add_to_allowlist":
         return _handle_add_to_allowlist(args, scopes_data, sender_id, env_path)
+    if name == "onboard_user":
+        return _handle_onboard_user(
+            args, scopes_data, sender_id, env_path, scopes_yaml_path,
+        )
     if name == "record_pending_user":
         return _handle_record_pending_user(args, pending_path)
     if name == "list_pending_users":
