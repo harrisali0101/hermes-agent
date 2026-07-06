@@ -288,6 +288,18 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # repopulates it.
         self._last_inbound_wamid_by_chat: "OrderedDict[str, str]" = OrderedDict()
 
+        # Per-chat cache of whether the latest inbound message was a
+        # voice note. Feeds the voice-lane output selector in ``send()``
+        # — voice-out fires only when the persona attached a
+        # ``[VOICE_REPLY]`` marker AND this cache says the last inbound
+        # from the same chat was voice. Values are the strings "1" /
+        # "0" (OrderedDict keeps the same _bounded_put helper the wamid
+        # cache uses; a bool-valued cache would fork the helper). See
+        # ``azure/config/rules/VOICE_LANE.md`` in hermes-personal-agent
+        # for the persona contract and
+        # ``azure/design/voice-round-trip.md`` for the design memo.
+        self._last_inbound_was_voice_by_chat: "OrderedDict[str, str]" = OrderedDict()
+
         # Interactive-button state. Each maps a short id (embedded in the
         # outbound button payload) → the session/correlation key needed
         # by the gateway's resolver. See ``_handle_interactive_reply`` for
@@ -455,6 +467,29 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        # Voice-lane hook — if the persona attached a ``[VOICE_REPLY]``
+        # marker at the head of the reply AND the last inbound from this
+        # chat was itself a voice note, synthesise + send as a voice
+        # bubble. Falls back to text on any failure. See
+        # ``azure/config/rules/VOICE_LANE.md`` (persona contract) and
+        # ``azure/design/voice-round-trip.md`` (design memo) in the
+        # hermes-personal-agent repo.
+        stripped_content, voice_intended = self._extract_voice_marker(content)
+        if stripped_content is not content:
+            # Marker was present — either honour it (voice send) or
+            # strip and fall through to text. The user must never see
+            # the raw ``[VOICE_REPLY]`` prefix in text output.
+            content = stripped_content
+            if voice_intended and self._last_inbound_was_voice_by_chat.get(chat_id) == "1":
+                voice_result = await self._maybe_send_voice_reply(
+                    chat_id, content, reply_to=reply_to,
+                )
+                if voice_result is not None:
+                    return voice_result
+                # Voice path signalled fallback — continue with the
+                # (marker-stripped) text send below. Reply is never
+                # dropped.
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self._outgoing_chunk_limit())
@@ -1191,6 +1226,159 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             filename=file_name or os.path.basename(file_path),
             reply_to=reply_to,
         )
+
+    # ------------------------------------------------------------------ voice-lane (DIH)
+    #
+    # Persona-driven voice-out selector. VOICE_LANE.md (persona rule)
+    # tells the model to prefix a reply with ``[VOICE_REPLY]\n\n`` when
+    # it wants the gateway to deliver the reply as a voice bubble
+    # instead of text. This section:
+    #
+    #   * ``_extract_voice_marker`` parses the marker off the head of
+    #     the reply body (idempotent — no marker means the caller
+    #     receives back the SAME object, letting ``send()`` detect via
+    #     ``is`` that nothing was stripped).
+    #   * ``_maybe_send_voice_reply`` synthesises via Azure Speech
+    #     Services (see ``agent/tts_azure_speech.py``), uploads the
+    #     resulting OGG Opus bytes via ``_upload_media``, and sends as a
+    #     voice bubble. Returns ``None`` on ANY failure so the caller
+    #     falls back to text — the reply is never dropped.
+    #
+    # Cache side: ``_last_inbound_was_voice_by_chat`` is updated on
+    # every accepted inbound; ``send()`` reads it before invoking the
+    # voice path.
+
+    # Marker the persona attaches at the head of a voice-intended
+    # reply. Match at the very start, tolerate leading whitespace, and
+    # allow either a bare marker or the ``[VOICE_REPLY]\n\n<body>``
+    # shape VOICE_LANE.md documents.
+    _VOICE_MARKER_RE = re.compile(r"\A\s*\[VOICE_REPLY\]\s*\n?", re.IGNORECASE)
+
+    @classmethod
+    def _extract_voice_marker(cls, content: str) -> tuple[str, bool]:
+        """Peel the ``[VOICE_REPLY]`` marker off the head of ``content``.
+
+        Returns ``(stripped_content, voice_intended)``. When the marker
+        is ABSENT the returned tuple contains ``content`` itself (same
+        object) so callers can compare with ``is`` — allowing the fast
+        path to skip the voice-lane logic entirely.
+        """
+        match = cls._VOICE_MARKER_RE.match(content)
+        if not match:
+            return content, False
+        return content[match.end():].lstrip(), True
+
+    async def _maybe_send_voice_reply(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str] = None,
+    ) -> Optional[SendResult]:
+        """Attempt to send ``content`` as a WhatsApp voice bubble.
+
+        Returns a ``SendResult`` on success, ``None`` to signal the
+        caller should fall back to a text send (TTS unavailable, empty
+        synthesis, upload failure, etc.). Never raises — every failure
+        path logs at ``warning`` and returns ``None``.
+        """
+        text = content.strip()
+        if not text:
+            # Nothing to speak — let the caller send the (empty) text
+            # so the base contract's empty-content short-circuit fires.
+            return None
+
+        # Import lazily so the module loads even when the DIH voice
+        # helper module isn't present (e.g. running upstream tests in
+        # a checkout without the DIH additions). ``tts_bytes`` is
+        # synchronous and blocking; run in the default executor so we
+        # don't stall the aiohttp webhook loop for TTS's ~1s latency.
+        try:
+            from agent.tts_azure_speech import tts_bytes, TTSError
+        except ImportError:
+            logger.warning(
+                "[whatsapp_cloud] voice-lane: agent.tts_azure_speech "
+                "not importable — falling back to text send"
+            )
+            return None
+
+        loop = asyncio.get_event_loop()
+        try:
+            audio_bytes = await loop.run_in_executor(None, tts_bytes, text)
+        except TTSError as exc:
+            logger.warning(
+                "[whatsapp_cloud] voice-lane: TTS failed (%s) — "
+                "falling back to text send", exc,
+            )
+            return None
+        except Exception:
+            # Defensive: unexpected errors from the executor path
+            # should never take down the reply. Log with traceback.
+            logger.exception(
+                "[whatsapp_cloud] voice-lane: unexpected TTS error — "
+                "falling back to text send"
+            )
+            return None
+
+        if not audio_bytes:
+            logger.warning(
+                "[whatsapp_cloud] voice-lane: TTS returned empty bytes "
+                "— falling back to text send"
+            )
+            return None
+
+        # Write the synthesised audio to the same media-cache dir the
+        # inbound path uses so the temp file is cleaned up by the same
+        # rotation policy. ``.ogg`` extension so ``_upload_media`` picks
+        # the correct MIME.
+        cache_dir = Path(get_hermes_dir()) / "platforms" / "whatsapp_cloud" / "media"
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logger.exception(
+                "[whatsapp_cloud] voice-lane: could not create media cache "
+                "dir %s — falling back to text send", cache_dir,
+            )
+            return None
+
+        audio_path = cache_dir / f"tts-{uuid.uuid4().hex}.ogg"
+        try:
+            audio_path.write_bytes(audio_bytes)
+        except OSError:
+            logger.exception(
+                "[whatsapp_cloud] voice-lane: could not write synthesised "
+                "audio to %s — falling back to text send", audio_path,
+            )
+            return None
+
+        try:
+            media_id, err = await self._upload_media(
+                str(audio_path), "audio", mime_type="audio/ogg; codecs=opus",
+            )
+            if err or not media_id:
+                logger.warning(
+                    "[whatsapp_cloud] voice-lane: media upload failed (%s) "
+                    "— falling back to text send", err or "no media_id",
+                )
+                return None
+
+            result = await self._send_media(
+                chat_id, "audio", media_id=media_id, reply_to=reply_to,
+            )
+            if not result.success:
+                logger.warning(
+                    "[whatsapp_cloud] voice-lane: voice send failed (%s) "
+                    "— falling back to text send", result.error,
+                )
+                return None
+            return result
+        finally:
+            # Clean up the transient synthesis file — the upload has
+            # already read it into Meta's media store.
+            try:
+                audio_path.unlink()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------ opus conversion
     async def _convert_to_opus(self, mp3_path: str) -> Optional[str]:
@@ -1990,6 +2178,15 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # gating) so filtered messages don't leak typing on
             # unwanted inbound traffic.
             self._bounded_put(self._last_inbound_wamid_by_chat, chat_id, wamid)
+
+        # Refresh the per-chat "was the last inbound a voice note?"
+        # cache. Consulted in ``send()`` by the voice-lane selector.
+        # Any non-voice inbound resets the flag to "0" so a text
+        # follow-up to a voice note cleanly falls back to text output
+        # even if the persona still emits the ``[VOICE_REPLY]`` marker.
+        if chat_id:
+            was_voice = "1" if message_type == MessageType.VOICE else "0"
+            self._bounded_put(self._last_inbound_was_voice_by_chat, chat_id, was_voice)
 
         return MessageEvent(
             text=body,
