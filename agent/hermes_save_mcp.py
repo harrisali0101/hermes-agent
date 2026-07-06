@@ -735,63 +735,24 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                 },
             },
             {
-                "name": "add_to_allowlist",
-                "description": (
-                    "STEP 1 of onboarding a new user: add their PHONE "
-                    "NUMBER (digits only, no '+') to the gateway-level "
-                    "allowlist (WHATSAPP_ALLOWED_USERS in ~/.hermes/.env). "
-                    "Until this is done, messages from the new user are "
-                    "DROPPED at the gateway before reaching the bot. The "
-                    "lid (used for role assignment in step 2) is only "
-                    "visible after they send their first message, so "
-                    "allowlisting always comes first. Only super_admins "
-                    "(Harris, Shahzaib today) may call this; the tool "
-                    "re-checks server-side. Hermes reloads the .env per "
-                    "turn, so the change takes effect on the next message."
-                ),
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "sender_id": _SENDER_LID_SCHEMA,
-                        "phone": {
-                            "type": "string",
-                            "description": (
-                                "Phone number, digits only, no '+'. "
-                                "Example: 923333717117 for +92 333 3717117. "
-                                "International format; country code first."
-                            ),
-                        },
-                        "memo": {
-                            "type": "string",
-                            "description": (
-                                "Optional one-line note for the audit "
-                                "comment that the tool writes above the "
-                                "key line (e.g. 'CEO Iyad — pending lid')."
-                            ),
-                        },
-                    },
-                    "required": ["sender_id", "phone"],
-                },
-            },
-            {
                 "name": "onboard_user",
                 "description": (
-                    "PREFERRED single-shot onboarding for the DIH pilot. "
-                    "Adds the phone to the gateway allowlist AND writes the "
-                    "role assignment to scopes.yaml AND spawns the gateway "
-                    "restart, all atomically. Under WhatsApp Cloud API, "
-                    "wa_id == phone (E.164 digits, no `+`) — so we do NOT "
-                    "need to wait for the new user's first message before "
-                    "assigning their role. Super_admin only; re-checked "
-                    "server-side. Available roles: " + ", ".join(available_roles)
-                    + " (super_admin is a separate high-privilege path — "
-                    "use approve_user with confirm_super_admin=true for that). "
-                    "Saga pattern: any step failure triggers full rollback so "
-                    "the user is never left half-onboarded. If the user is "
-                    "already fully on-scope with the same role+name, this is "
-                    "an idempotent no-op success. For the granular "
-                    "allowlist-only or approve-only flows, use "
-                    "add_to_allowlist / approve_user directly."
+                    "THE onboarding tool for the DIH pilot. Adds the phone to "
+                    "the gateway allowlist AND writes the role assignment to "
+                    "scopes.yaml AND spawns the gateway restart, all "
+                    "atomically. Under WhatsApp Cloud API, wa_id == phone "
+                    "(E.164 digits, no `+`) — so we do NOT need to wait for "
+                    "the new user's first message before assigning their "
+                    "role. Super_admin caller only; re-checked server-side. "
+                    "Available roles: " + ", ".join(available_roles)
+                    + ", or 'super_admin' (requires confirm_super_admin=true "
+                    "— see below). Saga pattern: any step failure triggers "
+                    "full rollback so the user is never left half-onboarded. "
+                    "Idempotent: same phone+role+name is a no-op success. "
+                    "Refuses to overwrite: same phone with different role/name "
+                    "errors out; caller must revoke_user first. To PROMOTE a "
+                    "normal user to super_admin (or DEMOTE a super_admin), "
+                    "revoke_user first, then onboard_user with the new role."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -814,11 +775,23 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                         },
                         "role": {
                             "type": "string",
-                            "enum": available_roles,
+                            "enum": available_roles + ["super_admin"],
                             "description": (
-                                "One of the pilot roles. Do NOT pass "
-                                "'super_admin' here — use approve_user for "
-                                "that path (extra confirmation required)."
+                                "One of the pilot roles, OR 'super_admin' for "
+                                "the high-privilege identity that reads every "
+                                "scope + can run on/off-boarding. Granting "
+                                "'super_admin' ALSO requires "
+                                "confirm_super_admin=true; the tool refuses "
+                                "otherwise."
+                            ),
+                        },
+                        "confirm_super_admin": {
+                            "type": "boolean",
+                            "description": (
+                                "Set true ONLY when role='super_admin' — an "
+                                "explicit confirmation the caller intends to "
+                                "grant high-privilege super_admin access. "
+                                "Ignored for other roles."
                             ),
                         },
                         "memo": {
@@ -830,85 +803,6 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                         },
                     },
                     "required": ["sender_id", "phone", "name", "role"],
-                },
-            },
-            {
-                "name": "approve_user",
-                "description": (
-                    "Onboard a new user to the DIH pilot by writing them "
-                    "into scopes.yaml with a role. **PREFER `onboard_user` "
-                    "for the common case** (single-shot allowlist + "
-                    "scopes.yaml + restart). Reach for approve_user only "
-                    "when (a) granting super_admin, or (b) the phone is "
-                    "already on the allowlist from a prior step and you "
-                    "just need to assign a role. Only super_admins (CEOs "
-                    "or dev-tier admins) may call this; the tool re-checks "
-                    "authorization server-side and refuses if the caller "
-                    "is not a super_admin. The new user's role determines "
-                    "which scopes they can read and write. Available roles: "
-                    + ", ".join(available_roles) + " (plus implicit "
-                    "'super_admin' which is added via SSH only, never chat). "
-                    "Cache is invalidated automatically on the next turn."
-                ),
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "sender_id": _SENDER_LID_SCHEMA,
-                        "target_id": {
-                            "type": "string",
-                            "description": (
-                                "WhatsApp wa_id of the user to approve "
-                                "(bare digits, e.g., `923333717117`). "
-                                "Captured verbatim from the verified-sender "
-                                "marker on a message the new user has "
-                                "already sent — Meta's Cloud API delivers "
-                                "the real E.164 number minus the `+` prefix."
-                            ),
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": (
-                                "Human-readable name (e.g., 'Tareq', "
-                                "'Iyad Mazhar'). Used in audit and persona "
-                                "context; doesn't need to match anything "
-                                "else exactly."
-                            ),
-                        },
-                        "role": {
-                            "type": "string",
-                            "enum": available_roles + ["super_admin"],
-                            "description": (
-                                "One of the roles defined in scopes.yaml, OR "
-                                "'super_admin' (high-privilege: reads every "
-                                "scope + onboarding/offboarding tools). "
-                                "Granting super_admin ALSO requires "
-                                "confirm_super_admin=true and a WhatsApp-"
-                                "resolved target lid. See AGENTS.md for the "
-                                "role-to-scope mapping."
-                            ),
-                        },
-                        "confirm_super_admin": {
-                            "type": "boolean",
-                            "description": (
-                                "Set true ONLY when role='super_admin' — an "
-                                "explicit acknowledgement you're minting a "
-                                "high-privilege super_admin. Ignored for normal "
-                                "roles. The server also requires the caller to "
-                                "be a super_admin and the target lid to be "
-                                "WhatsApp-resolved (no typos/guesses)."
-                            ),
-                        },
-                        "platform": {
-                            "type": "string",
-                            "description": (
-                                "Messaging platform. Defaults to 'whatsapp' "
-                                "if omitted. Currently the only supported "
-                                "value, but reserved for future Teams/SMS "
-                                "integrations."
-                            ),
-                        },
-                    },
-                    "required": ["sender_id", "target_id", "name", "role"],
                 },
             },
             {
@@ -1034,23 +928,6 @@ def _handle_tools_list(scopes_data: Dict[str, Any]) -> Dict[str, Any]:
                         },
                     },
                     "required": ["sender_id", "target_id", "scope"],
-                },
-            },
-            {
-                "name": "reload_gateway",
-                "description": (
-                    "Restart the Hermes gateway so a just-changed allowlist "
-                    "(add_to_allowlist / remove_from_allowlist) takes effect "
-                    "— the allowlist is read only at gateway startup. Call "
-                    "this AFTER the Owner confirms, since it briefly drops the "
-                    "WhatsApp connection (~15-20s) and ends the current "
-                    "session. NOT needed for approve_user/revoke_user (those "
-                    "hot-reload via scopes.yaml mtime). Super_admin only."
-                ),
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"sender_id": _SENDER_LID_SCHEMA},
-                    "required": ["sender_id"],
                 },
             },
             {
@@ -1966,6 +1843,7 @@ def _handle_onboard_user(
             name=str(args.get("name") or ""),
             role=str(args.get("role") or ""),
             memo=str(args.get("memo") or "") or None,
+            confirm_super_admin=bool(args.get("confirm_super_admin")),
             sender_id=sender_id,
             env_path=env_path,
             scopes_yaml_path=scopes_yaml_path,
@@ -1975,6 +1853,8 @@ def _handle_onboard_user(
             remove_phone_fn=_remove_phone_from_allowlist,
             append_user_fn=_append_user_to_scopes_yaml,
             remove_user_fn=_remove_user_from_scopes_yaml,
+            append_super_admin_fn=_append_super_admin_to_scopes_yaml,
+            remove_super_admin_fn=_remove_super_admin_from_scopes_yaml,
             restart_gateway_fn=_restart_gateway_detached,
             platform="whatsapp_cloud",
             available_roles=available_roles,
@@ -3011,12 +2891,24 @@ def _handle_tools_call(
         }
     role = _resolve_role(scopes_data, sender_id)
 
-    if name == "approve_user":
-        return _handle_approve_user(
-            args, scopes_data, sender_id, role, scopes_yaml_path,
-        )
-    if name == "add_to_allowlist":
-        return _handle_add_to_allowlist(args, scopes_data, sender_id, env_path)
+    if name in {"approve_user", "add_to_allowlist", "reload_gateway"}:
+        # Removed 2026-07-06 — folded into onboard_user (which does
+        # allowlist + scopes.yaml + restart in one atomic saga, and now
+        # also handles super_admin via confirm_super_admin=true). Left
+        # as an explicit error branch so the persona sees a clear
+        # message if it reaches for the old name from cached memory.
+        return {
+            "isError": True,
+            "content": [{"type": "text", "text": (
+                f"Tool '{name}' has been removed (2026-07-06). Use "
+                "onboard_user(phone, name, role, memo?, confirm_super_admin?) "
+                "— it now covers every onboarding case in one atomic call "
+                "(allowlist + scopes.yaml + gateway restart, with saga "
+                "rollback on any failure). For revoking, use revoke_user "
+                "(unchanged). For a bare gateway restart, ask a super_admin "
+                "with SSH access to run 'sudo systemctl restart hermes.service'."
+            )}],
+        }
     if name == "onboard_user":
         return _handle_onboard_user(
             args, scopes_data, sender_id, env_path, scopes_yaml_path,
@@ -3039,8 +2931,6 @@ def _handle_tools_call(
         return _handle_grant_scope_access(args, scopes_data, sender_id, scopes_yaml_path)
     if name == "revoke_scope_access":
         return _handle_revoke_scope_access(args, scopes_data, sender_id, scopes_yaml_path)
-    if name == "reload_gateway":
-        return _handle_reload_gateway(scopes_data, sender_id)
     if name == "send_template_message":
         return _handle_send_template_message(args, scopes_data, sender_id)
     if name == "voice_list":

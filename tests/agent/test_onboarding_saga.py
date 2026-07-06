@@ -49,6 +49,7 @@ class _Stubs:
         raise_on_append_user: Optional[Exception] = None,
         raise_on_remove_phone: Optional[Exception] = None,
         raise_on_remove_user: Optional[Exception] = None,
+        raise_on_append_super_admin: Optional[Exception] = None,
         restart_returns: bool = True,
         raise_on_restart: Optional[Exception] = None,
     ):
@@ -57,6 +58,7 @@ class _Stubs:
         self.raise_on_append_user = raise_on_append_user
         self.raise_on_remove_phone = raise_on_remove_phone
         self.raise_on_remove_user = raise_on_remove_user
+        self.raise_on_append_super_admin = raise_on_append_super_admin
         self.restart_returns = restart_returns
         self.raise_on_restart = raise_on_restart
         self.calls: List[str] = []
@@ -93,6 +95,15 @@ class _Stubs:
             raise self.raise_on_remove_user
         return True
 
+    def append_super_admin(self, path: str, target_id: str, name: str, sender_id: str) -> None:
+        self.calls.append(f"append_super_admin:{target_id}:{name}:granted_by={sender_id}")
+        if self.raise_on_append_super_admin:
+            raise self.raise_on_append_super_admin
+
+    def remove_super_admin(self, path: str, target_id: str) -> bool:
+        self.calls.append(f"remove_super_admin:{target_id}")
+        return True
+
     def restart_gateway(self) -> bool:
         self.calls.append("restart_gateway")
         if self.raise_on_restart:
@@ -107,11 +118,13 @@ def _run(
     name: str = "Iyad Mazhar",
     role: str = "ceo",
     memo: Optional[str] = None,
+    confirm_super_admin: bool = False,
     scopes_data: Optional[Dict[str, Any]] = None,
     available_roles: Optional[List[str]] = None,
 ) -> SagaResult:
     return run_onboard_user_saga(
         phone=phone, name=name, role=role, memo=memo,
+        confirm_super_admin=confirm_super_admin,
         sender_id="923333717117",
         env_path="/fake/.env",
         scopes_yaml_path="/fake/scopes.yaml",
@@ -121,6 +134,8 @@ def _run(
         remove_phone_fn=stubs.remove_phone,
         append_user_fn=stubs.append_user,
         remove_user_fn=stubs.remove_user,
+        append_super_admin_fn=stubs.append_super_admin,
+        remove_super_admin_fn=stubs.remove_super_admin,
         restart_gateway_fn=stubs.restart_gateway,
         available_roles=available_roles or ["ceo", "staff"],
     )
@@ -185,7 +200,7 @@ def test_failure_at_step_c_leaves_writes() -> None:
     # ok=True because writes succeeded; step C is soft-fail
     assert r.ok
     assert "NOT spawned" in r.text
-    assert "reload_gateway" in r.text.lower()
+    assert "systemctl restart hermes" in r.text
     assert "allowlist_appended" in r.steps_completed
     assert "scopes_yaml_appended" in r.steps_completed
     assert "gateway_restart_spawned" not in r.steps_completed
@@ -224,13 +239,84 @@ def test_input_validation_missing_name() -> None:
     print("test_input_validation_missing_name OK")
 
 
-def test_super_admin_refused() -> None:
+def test_super_admin_without_confirm_refused() -> None:
     stubs = _Stubs()
-    r = _run(stubs, role="super_admin", available_roles=["ceo", "staff", "super_admin"])
+    r = _run(stubs, role="super_admin", confirm_super_admin=False)
     assert not r.ok
-    assert "does not grant super_admin" in r.text
+    assert "confirm_super_admin=true" in r.text
     assert stubs.calls == []
-    print("test_super_admin_refused OK")
+    print("test_super_admin_without_confirm_refused OK")
+
+
+def test_super_admin_with_confirm_happy() -> None:
+    stubs = _Stubs()
+    r = _run(stubs, role="super_admin", confirm_super_admin=True)
+    assert r.ok, f"expected ok, got {r.text!r}"
+    assert "SUPER_ADMIN" in r.text
+    assert "super_admins entry written" in r.text
+    assert "super_admins_appended" in r.steps_completed
+    # Confirm the super_admin write went to the RIGHT primitive
+    assert any(c.startswith("append_super_admin") for c in stubs.calls)
+    assert not any(c.startswith("append_user") for c in stubs.calls)
+    print("test_super_admin_with_confirm_happy OK")
+
+
+def test_super_admin_idempotent_noop() -> None:
+    scopes = {
+        "roles": {"ceo": {}, "staff": {}},
+        "users": [],
+        "super_admins": [{"id": "923331234567", "name": "Iyad Mazhar"}],
+    }
+    stubs = _Stubs(current_allowlist=["923331234567"])
+    r = _run(
+        stubs, role="super_admin", confirm_super_admin=True,
+        scopes_data=scopes,
+    )
+    assert r.ok
+    assert "already a super_admin — no change" in r.text
+    assert stubs.calls == []  # no writes
+    print("test_super_admin_idempotent_noop OK")
+
+
+def test_super_admin_refuse_demote_to_normal_role() -> None:
+    scopes = {
+        "roles": {"ceo": {}, "staff": {}},
+        "users": [],
+        "super_admins": [{"id": "923331234567", "name": "Iyad Mazhar"}],
+    }
+    stubs = _Stubs(current_allowlist=["923331234567"])
+    r = _run(stubs, role="ceo", scopes_data=scopes)  # trying to demote
+    assert not r.ok
+    assert "already a super_admin" in r.text
+    assert "will NOT demote" in r.text
+    assert stubs.calls == []
+    print("test_super_admin_refuse_demote_to_normal_role OK")
+
+
+def test_refuse_promote_normal_to_super_admin() -> None:
+    scopes = _base_scopes_data([
+        {"id": "923331234567", "name": "Iyad Mazhar", "role": "ceo"}
+    ])
+    stubs = _Stubs(current_allowlist=["923331234567"])
+    r = _run(
+        stubs, role="super_admin", confirm_super_admin=True,
+        scopes_data=scopes,
+    )
+    assert not r.ok
+    assert "revoke_user first" in r.text
+    assert stubs.calls == []
+    print("test_refuse_promote_normal_to_super_admin OK")
+
+
+def test_super_admin_step_b_rollback() -> None:
+    """If the super_admin write fails, the allowlist append must be rolled back."""
+    stubs = _Stubs(raise_on_append_super_admin=RuntimeError("scopes.yaml locked"))
+    r = _run(stubs, role="super_admin", confirm_super_admin=True)
+    assert not r.ok
+    assert "Rolled back 1 step" in r.text
+    assert "remove_phone_from_allowlist" in r.steps_rolled_back
+    assert "923331234567" not in stubs.current_allowlist
+    print("test_super_admin_step_b_rollback OK")
 
 
 def test_role_not_in_available() -> None:
@@ -265,7 +351,12 @@ if __name__ == "__main__":
     test_rollback_failure_reported()
     test_input_validation_bad_phone()
     test_input_validation_missing_name()
-    test_super_admin_refused()
+    test_super_admin_without_confirm_refused()
+    test_super_admin_with_confirm_happy()
+    test_super_admin_idempotent_noop()
+    test_super_admin_refuse_demote_to_normal_role()
+    test_refuse_promote_normal_to_super_admin()
+    test_super_admin_step_b_rollback()
     test_role_not_in_available()
     test_already_on_allowlist_but_not_in_scopes()
-    print("\nall 11 tests passed")
+    print("\nall 16 tests passed")

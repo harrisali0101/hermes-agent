@@ -75,7 +75,10 @@ def run_onboard_user_saga(
     remove_phone_fn: Callable[[str, str], bool],
     append_user_fn: Callable[[str, str, str, str, str], None],
     remove_user_fn: Callable[[str, str], bool],
+    append_super_admin_fn: Callable[[str, str, str, str], None],
+    remove_super_admin_fn: Callable[[str, str], bool],
     restart_gateway_fn: Callable[[], bool],
+    confirm_super_admin: bool = False,
     platform: str = "whatsapp_cloud",
     available_roles: Optional[List[str]] = None,
 ) -> SagaResult:
@@ -110,22 +113,29 @@ def run_onboard_user_saga(
     if not role_clean:
         return SagaResult(ok=False, text="role is required.")
 
-    if role_clean == "super_admin":
+    is_super_admin_grant = role_clean == "super_admin"
+
+    if is_super_admin_grant and not confirm_super_admin:
         return SagaResult(
             ok=False,
             text=(
-                "onboard_user does not grant super_admin. Use approve_user "
-                "with confirm_super_admin=true for that path (higher-privilege, "
-                "extra confirmation required)."
+                "Granting super_admin is high-privilege — a super_admin reads "
+                "every scope, runs on/off-boarding, and can mint other "
+                "super_admins. Re-issue the call with confirm_super_admin=true "
+                "to proceed."
             ),
         )
 
-    if available_roles and role_clean not in available_roles:
+    # For non-super_admin roles, ensure the role is one of the configured
+    # scopes.yaml roles. super_admin is always accepted (it's not a
+    # roles.<role> entry — it's a top-level identity).
+    if not is_super_admin_grant and available_roles and role_clean not in available_roles:
         return SagaResult(
             ok=False,
             text=(
                 f"role '{role_clean}' is not a valid role for this pilot. "
-                f"Available: {', '.join(available_roles)}."
+                f"Available: {', '.join(available_roles)} (or 'super_admin' "
+                "with confirm_super_admin=true)."
             ),
         )
 
@@ -142,12 +152,69 @@ def run_onboard_user_saga(
             text=f"Could not read allowlist ({exc}). Aborting before any writes.",
         )
 
+    # Check super_admins block first: if phone_clean is already a
+    # super_admin AND caller is requesting super_admin, that's an
+    # idempotent no-op. If the phone is in super_admins but caller wants
+    # a normal role, refuse (would need to demote via a separate tool).
+    super_admins = (scopes_data.get("super_admins") or [])
+    for e in super_admins:
+        if str(e.get("id", "")).strip() == phone_clean:
+            existing_name = str(e.get("name", "")).strip()
+            if is_super_admin_grant:
+                if existing_name == name_clean:
+                    _log(
+                        "info", "onboard idempotent no-op — already super_admin",
+                        sender=sender_id, phone=phone_clean,
+                    )
+                    return SagaResult(
+                        ok=True,
+                        text=(
+                            f"✅ {name_clean} ({phone_clean}) is already a "
+                            f"super_admin — no change.\n\n"
+                            + ("(Also on the allowlist ✓)" if already_on_allowlist
+                               else "⚠️ super_admin entry exists but phone is NOT "
+                                    "on the gateway allowlist. That is unusual — "
+                                    "run onboard_user again to fix.")
+                        ),
+                        steps_completed=["idempotent_noop"],
+                    )
+                return SagaResult(
+                    ok=False,
+                    text=(
+                        f"{phone_clean} is already a super_admin under name "
+                        f"{existing_name!r}. onboard_user will NOT rename. "
+                        "Edit scopes.yaml directly if the name needs to change."
+                    ),
+                )
+            return SagaResult(
+                ok=False,
+                text=(
+                    f"{phone_clean} is already a super_admin. onboard_user "
+                    f"will NOT demote them to '{role_clean}'. Use revoke_user "
+                    "first (with the super_admin caveat) to demote."
+                ),
+            )
+
     users = (scopes_data.get("users") or [])
     for u in users:
         if str(u.get("id", "")).strip() == phone_clean:
             already_in_scopes = True
             existing_role = str(u.get("role", "")).strip()
             existing_name = str(u.get("name", "")).strip()
+            if is_super_admin_grant:
+                # Promoting a normal user to super_admin — the current
+                # design is to refuse and force explicit revoke + re-add,
+                # so audit trails are unambiguous.
+                return SagaResult(
+                    ok=False,
+                    text=(
+                        f"{phone_clean} exists as a normal user "
+                        f"({existing_name!r} / role={existing_role}). To "
+                        "promote to super_admin, revoke_user first, then "
+                        "re-run onboard_user with role='super_admin' + "
+                        "confirm_super_admin=true."
+                    ),
+                )
             if existing_role == role_clean and existing_name == name_clean:
                 _log(
                     "info", "onboard idempotent no-op",
@@ -161,7 +228,7 @@ def run_onboard_user_saga(
                         + ("(Also on the allowlist ✓)" if already_on_allowlist
                            else "⚠️ scopes.yaml entry exists but phone is NOT "
                                 "on the gateway allowlist. Run "
-                                "add_to_allowlist to fix.")
+                                "onboard_user again to fix.")
                     ),
                     steps_completed=["idempotent_noop"],
                 )
@@ -221,18 +288,31 @@ def run_onboard_user_saga(
                 steps_completed=steps_completed,
             )
 
-    # STEP B — write to scopes.yaml
+    # STEP B — write to scopes.yaml (super_admins block OR users block
+    # depending on the role).
     #
     # If already_in_scopes was True we would have returned earlier — so at
     # this point the scope.yaml write always fires.
     try:
-        append_user_fn(scopes_yaml_path, phone_clean, name_clean, role_clean, platform)
-        steps_completed.append("scopes_yaml_appended")
-        rollbacks.append((
-            "remove_user_from_scopes_yaml",
-            lambda: (remove_user_fn(scopes_yaml_path, phone_clean), None)[1],
-        ))
-        _log("info", "step B OK — user appended to scopes.yaml", phone=phone_clean)
+        if is_super_admin_grant:
+            append_super_admin_fn(scopes_yaml_path, phone_clean, name_clean, sender_id)
+            steps_completed.append("super_admins_appended")
+            rollbacks.append((
+                "remove_super_admin_from_scopes_yaml",
+                lambda: (remove_super_admin_fn(scopes_yaml_path, phone_clean), None)[1],
+            ))
+            _log(
+                "info", "step B OK — super_admin appended to scopes.yaml",
+                phone=phone_clean, granted_by=sender_id,
+            )
+        else:
+            append_user_fn(scopes_yaml_path, phone_clean, name_clean, role_clean, platform)
+            steps_completed.append("scopes_yaml_appended")
+            rollbacks.append((
+                "remove_user_from_scopes_yaml",
+                lambda: (remove_user_fn(scopes_yaml_path, phone_clean), None)[1],
+            ))
+            _log("info", "step B OK — user appended to scopes.yaml", phone=phone_clean)
     except Exception as exc:
         _log(
             "error", "step B failed — rolling back A",
@@ -282,7 +362,7 @@ def run_onboard_user_saga(
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     _log(
         "info", "onboard saga complete",
-        event="ONBOARD_USER_SUCCESS",
+        event="ONBOARD_SUPER_ADMIN_SUCCESS" if is_super_admin_grant else "ONBOARD_USER_SUCCESS",
         sender=sender_id,
         phone=phone_clean,
         name=name_clean,
@@ -302,15 +382,22 @@ def run_onboard_user_saga(
     else:
         tail = (
             "\n\n⚠️ Allowlist + scopes.yaml written OK, but the automatic "
-            "gateway restart could not be spawned. Run `reload_gateway` "
-            "manually to activate the new user (they'll be rejected until you do)."
+            "gateway restart could not be spawned. State is correct but "
+            "the new user will remain rejected until the gateway restarts. "
+            "Ask a super_admin with SSH access to run "
+            "`sudo systemctl restart hermes.service` on the VM."
         )
+    role_desc = "SUPER_ADMIN" if is_super_admin_grant else role_clean
+    scopes_line = (
+        "✓ super_admins entry written" if is_super_admin_grant
+        else "✓ user row written"
+    )
     return SagaResult(
         ok=True,
         text=(
-            f"✅ Onboarded {name_clean} ({phone_clean}) as {role_clean}.\n\n"
+            f"✅ Onboarded {name_clean} ({phone_clean}) as {role_desc}.\n\n"
             f"- allowlist: {'✓ added' if 'allowlist_appended' in steps_completed else '✓ already present'}\n"
-            f"- scopes.yaml: ✓ user row written\n"
+            f"- scopes.yaml: {scopes_line}\n"
             f"- gateway restart: {'✓ spawned' if restart_spawned else '⚠️ NOT spawned'}"
             + tail
         ),
