@@ -152,16 +152,26 @@ def _content_date(page: Any) -> Optional[str]:
 
 def _pick_anchor(pages: list) -> Optional[Dict[str, Any]]:
     """From an enriched page list, pick the anchor: newest structured doc
-    whose title matches _ANCHOR_TITLE_RE. Fallback: newest by content_date.
-    Returns None on empty input."""
+    whose title matches _ANCHOR_TITLE_RE. Returns None if no page matches
+    the regex — signals to the caller that no live status snapshot exists
+    to anchor against, so all enriched items should be surfaced as deltas.
+    Returns None on empty input too.
+
+    2026-07-08 (see azure/design/status-sweep-sparse-flag-bug.md): the
+    prior "newest by content_date" fallback caused the delta filter
+    `content_date > anchor_date` to always return [] (nothing is strictly
+    newer than the newest), which tripped sparse_flag=True on every run
+    once the corpus stopped containing anchor-regex-matching titles.
+    The caller in _handle_status_sweep_orchestration already has the
+    correct `if anchor is None:` branch wired — that branch was dead
+    code before this fix."""
     if not pages:
         return None
     matches = [p for p in pages if isinstance(p, dict) and _ANCHOR_TITLE_RE.search(str(p.get("title") or ""))]
-    if matches:
-        matches.sort(key=lambda p: _content_date(p) or "", reverse=True)
-        return matches[0]
-    sorted_all = sorted(pages, key=lambda p: _content_date(p) or "", reverse=True)
-    return sorted_all[0] if sorted_all else None
+    if not matches:
+        return None
+    matches.sort(key=lambda p: _content_date(p) or "", reverse=True)
+    return matches[0]
 
 
 def _shape_page_for_envelope(page: Dict[str, Any]) -> Dict[str, Any]:
